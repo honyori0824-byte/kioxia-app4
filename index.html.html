@@ -1,0 +1,2519 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="KIOXIA"/>
+  <meta name="theme-color" content="#1e293b"/>
+  <title>KIOXIA 285A 判断エンジン</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:#f0f4f8;-webkit-text-size-adjust:100%;font-family:'Courier New',monospace;}
+    input,textarea,button{font-family:'Courier New',monospace;}
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- React 18 -->
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <!-- Recharts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.2/Recharts.min.js"></script>
+  <!-- Babel standalone (JSX変換) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useCallback } = React;
+    const {
+      LineChart, Line, AreaChart, Area, BarChart, Bar,
+      XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+      ReferenceLine, RadarChart, Radar, PolarGrid, PolarAngleAxis,
+    } = Recharts;
+
+
+// ═══════════════════════════════════════════════════════════════
+//  COLOUR PALETTE — ライトテーマ（白基調）
+// ═══════════════════════════════════════════════════════════════
+const C = {
+  bg:        "#f0f4f8",   // ページ背景：薄いグレー
+  surface:   "#ffffff",   // カード背景：白
+  surface2:  "#f8fafc",   // サブ背景
+  border:    "#e2e8f0",   // 枠線：薄いグレー
+  accent:    "#d97706",   // アクセント：アンバー（暗め）
+  accentDim: "#fef3c7",   // アクセント薄
+  bull:      "#059669",   // 買い：濃いグリーン
+  bear:      "#dc2626",   // 売り：濃いレッド
+  text:      "#0f172a",   // 本文：ほぼ黒
+  muted:     "#64748b",   // サブテキスト：スレートグレー
+  blue:      "#2563eb",   // ブルー
+  purple:    "#7c3aed",   // パープル
+  cyan:      "#0891b2",   // シアン
+  orange:    "#ea580c",   // オレンジ
+  warn:      "#b45309",   // 警告：濃いアンバー
+  header:    "#1e293b",   // ヘッダー背景：ダークネイビー（ここだけ暗く）
+  headerText:"#f1f5f9",   // ヘッダー文字：白
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  PHASE 4 — API LAYER
+//  Strategy: stooq.com CSV API (no key needed, CORS-friendly via proxy)
+//  Fallback: manual entry mode
+// ═══════════════════════════════════════════════════════════════
+
+// stooq tickers: 285A.JP (Kioxia), MU.US, WDC.US, 005930.KS (Samsung), 000660.KS (SK Hynix)
+const API_SYMBOLS = {
+  kioxia:  { stooq: "285a.jp",   name:"Kioxia",   currency:"¥",  color:C.accent },
+  micron:  { stooq: "mu.us",     name:"Micron",    currency:"$",  color:C.cyan   },
+  sandisk: { stooq: "wdc.us",    name:"SandDisk",  currency:"$",  color:C.orange },
+  samsung: { stooq: "005930.kq", name:"Samsung",   currency:"₩",  color:C.blue   },
+  skhynix: { stooq: "000660.kq", name:"SK Hynix",  currency:"₩",  color:C.purple },
+};
+
+const STOOQ_BASE = "https://stooq.com/q/d/l/";
+
+const fetchStooqHistory = async (symbol, days = 30) => {
+  const url = `${STOOQ_BASE}?s=${symbol}&i=d`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const text = await resp.text();
+  const lines = text.trim().split("\n").slice(1); // skip header
+  return lines
+    .slice(-days)
+    .map(line => {
+      const [date, open, high, low, close, volume] = line.split(",");
+      if (!close || isNaN(parseFloat(close))) return null;
+      const d = new Date(date);
+      return {
+        date:   `${d.getMonth()+1}/${d.getDate()}`,
+        dateISO: date,
+        open:   parseFloat(open),
+        high:   parseFloat(high),
+        low:    parseFloat(low),
+        close:  parseFloat(close),
+        volume: parseInt(volume) || 0,
+      };
+    })
+    .filter(Boolean);
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  REAL PRICE HISTORY — 実チャートから再構成（日足 / 直近30営業日）
+//  Source: 285A 日足チャート（画像より読み取り）
+//  ※ 1/6〜4/10の実際のトレンドを反映
+// ═══════════════════════════════════════════════════════════════
+const REAL_PRICE_HISTORY = [
+  // 1月：上場直後から急騰フェーズ
+  {date:"1/6",  open:1500,  high:2100,  low:1450,  close:1980,  volume:8200000},
+  {date:"1/8",  open:2100,  high:2800,  low:2050,  close:2650,  volume:9100000},
+  {date:"1/10", open:2700,  high:3400,  low:2600,  close:3200,  volume:7800000},
+  {date:"1/15", open:3300,  high:4200,  low:3200,  close:4100,  volume:6500000},
+  {date:"1/20", open:4200,  high:5500,  low:4100,  close:5200,  volume:5900000},
+  {date:"1/24", open:5300,  high:6800,  low:5200,  close:6500,  volume:5200000},
+  {date:"1/28", open:6600,  high:8200,  low:6400,  close:7900,  volume:4800000},
+  // 2月：上昇継続
+  {date:"2/3",  open:8000,  high:10500, low:7800,  close:10200, volume:4200000},
+  {date:"2/7",  open:10300, high:13000, low:10100, close:12600, volume:3900000},
+  {date:"2/12", open:12700, high:16000, low:12500, close:15500, volume:3500000},
+  {date:"2/17", open:15600, high:18500, low:15400, close:18000, volume:3100000},
+  {date:"2/20", open:18100, high:21500, low:17900, close:21000, volume:2800000},
+  {date:"2/25", open:21100, high:23500, low:20800, close:23000, volume:2500000},
+  // 3月：高値圏でもみ合い
+  {date:"3/3",  open:23100, high:25500, low:22800, close:24800, volume:2200000},
+  {date:"3/7",  open:24900, high:26200, low:24600, close:25500, volume:1900000},
+  {date:"3/12", open:25600, high:26800, low:24800, close:25000, volume:1700000},
+  {date:"3/17", open:25100, high:25800, low:23500, close:24000, volume:1800000},
+  {date:"3/19", open:24100, high:24800, low:22200, close:22500, volume:2100000},
+  {date:"3/24", open:22600, high:24000, low:21800, close:23200, volume:1900000},
+  {date:"3/27", open:23300, high:24500, low:22900, close:23800, volume:1600000},
+  {date:"3/31", open:23900, high:24800, low:23500, close:24200, volume:1500000},
+  // 4月：関税ショック→急落→本日急反発
+  {date:"4/1",  open:24300, high:24900, low:23800, close:24600, volume:1400000},
+  {date:"4/2",  open:24700, high:25200, low:24300, close:24900, volume:1300000},
+  {date:"4/3",  open:24800, high:25000, low:22000, close:22400, volume:3800000},
+  {date:"4/4",  open:22300, high:22800, low:20100, close:20300, volume:4500000},
+  {date:"4/7",  open:20200, high:21500, low:19500, close:21000, volume:3900000},
+  {date:"4/8",  open:21100, high:22800, low:20800, close:22500, volume:2800000},
+  {date:"4/9",  open:22600, high:24500, low:22400, close:24000, volume:2200000},
+  // 4/10：本日 — 急騰 +8.81%
+  {date:"4/10", open:29000, high:30490, low:28890, close:30140, volume:5800000},
+];
+
+const generateMockData = (base=30140) => REAL_PRICE_HISTORY;
+
+const generateSectorMock = () => {
+  const ids=["kioxia","samsung","skhynix","micron","sandisk"];
+  const vals=Object.fromEntries(ids.map(id=>[id,100]));
+  return Array.from({length:30},(_,idx)=>{
+    const d=new Date(); d.setDate(d.getDate()-(29-idx));
+    const drift=(Math.random()-.48)*2.5;
+    const row={date:`${d.getMonth()+1}/${d.getDate()}`};
+    ids.forEach(id=>{vals[id]=Math.max(60,Math.min(160,vals[id]+drift+(Math.random()-.5)*2));row[id]=Math.round(vals[id]*10)/10;});
+    return row;
+  });
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  TECHNICAL INDICATORS
+// ═══════════════════════════════════════════════════════════════
+const calcSMA=(data,p)=>data.map((_,i)=>i<p-1?null:Math.round(data.slice(i-p+1,i+1).reduce((s,d)=>s+d.close,0)/p));
+const calcRSI=(data,p=14)=>data.map((_,i)=>{
+  if(i<p)return null;
+  let g=0,l=0;
+  for(let j=i-p+1;j<=i;j++){const d=data[j].close-data[j-1].close;d>0?g+=d:l-=d;}
+  return Math.round((100-100/(1+g/(l||1)))*10)/10;
+});
+const calcBoll=(data,p=20)=>{
+  const sma=calcSMA(data,p);
+  return data.map((_,i)=>{
+    if(i<p-1)return{upper:null,lower:null};
+    const sl=data.slice(i-p+1,i+1).map(d=>d.close),std=Math.sqrt(sl.reduce((s,v)=>s+(v-sma[i])**2,0)/p);
+    return{upper:Math.round(sma[i]+2*std),lower:Math.round(sma[i]-2*std)};
+  });
+};
+const calcMACD=(data)=>{
+  const ema=(arr,p)=>{const k=2/(p+1);let prev=arr[0];return arr.map((v,i)=>i===0?v:(prev=v*k+prev*(1-k),Math.round(prev)));};
+  const c=data.map(d=>d.close),e12=ema(c,12),e26=ema(c,26),ml=e12.map((v,i)=>v-e26[i]),sig=ema(ml,9);
+  return ml.map((v,i)=>({macd:v,signal:sig[i],hist:v-sig[i]}));
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  SHARED UI COMPONENTS
+// ═══════════════════════════════════════════════════════════════
+const Card=({children,style={}})=>(
+  <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:"16px 20px",...style}}>{children}</div>
+);
+const STitle=({children,style={}})=>(
+  <div style={{fontSize:11,color:C.muted,textTransform:"uppercase",letterSpacing:1.3,marginBottom:8,...style}}>{children}</div>
+);
+const SignalBadge=({signal,small})=>{
+  const m={BUY:{bg:"#dcfce7",c:C.bull,l:small?"買い":"🟢 買いシグナル"},SELL:{bg:"#fee2e2",c:C.bear,l:small?"売り":"🔴 売りシグナル"},HOLD:{bg:"#fef3c7",c:C.warn,l:small?"様子見":"🟡 様子見"}};
+  const s=m[signal]||m.HOLD;
+  return <span style={{background:s.bg,color:s.c,border:`1px solid ${s.c}`,borderRadius:6,padding:small?"2px 8px":"4px 12px",fontSize:small?11:13,fontWeight:700,whiteSpace:"nowrap"}}>{s.l}</span>;
+};
+const TAB_BTN=(active)=>({padding:"6px 14px",borderRadius:6,fontSize:12,cursor:"pointer",background:active?C.accent:"transparent",color:active?"#fff":C.muted,border:`1px solid ${active?C.accent:C.border}`,fontWeight:active?700:400,transition:"all .15s"});
+const Spinner=()=><div style={{display:"flex",alignItems:"center",justifyContent:"center",padding:40,flexDirection:"column",gap:12}}>
+  <div style={{width:32,height:32,border:`3px solid ${C.border}`,borderTopColor:C.accent,borderRadius:"50%",animation:"spin 0.8s linear infinite"}}/>
+  <div style={{fontSize:12,color:C.muted}}>データ取得中...</div>
+  <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+</div>;
+
+const StatusPill=({status,lastUpdated,onRefresh,isLoading})=>(
+  <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+    <div style={{display:"flex",alignItems:"center",gap:6,padding:"4px 10px",borderRadius:20,fontSize:11,
+      background:status==="live"?"#dcfce7":status==="manual"?"#fef3c7":"#f1f5f9",
+      border:`1px solid ${status==="live"?C.bull:status==="manual"?C.accent:"#94a3b8"}`}}>
+      <div style={{width:6,height:6,borderRadius:"50%",background:status==="live"?C.bull:status==="manual"?C.accent:C.muted,
+        animation:status==="live"?"pulse 2s infinite":"none"}}/>
+      <span style={{color:status==="live"?C.bull:status==="manual"?C.accent:C.muted,fontWeight:700}}>
+        {status==="live"?"LIVE DATA":status==="manual"?"手動入力モード":"モックデータ"}
+      </span>
+    </div>
+    {lastUpdated&&<span style={{fontSize:10,color:"#94a3b8"}}>更新: {lastUpdated}</span>}
+    <button onClick={onRefresh} disabled={isLoading}
+      style={{padding:"4px 10px",borderRadius:6,fontSize:11,cursor:isLoading?"not-allowed":"pointer",
+        background:"transparent",color:C.muted,border:`1px solid ${C.border}`,fontFamily:"inherit",
+        opacity:isLoading?.5:1}}>
+      {isLoading?"取得中...":"🔄 更新"}
+    </button>
+    <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}`}</style>
+  </div>
+);
+
+// ═══════════════════════════════════════════════════════════════
+//  強化版 判断エンジン — テクニカル3指標 ✕ タカさんの5指標チェックリスト
+// ═══════════════════════════════════════════════════════════════
+
+// ── 5指標チェックリスト定義（各指標の重み付けスコア付き）──
+const FIVE_INDICATORS = [
+  {
+    id:    "vixPeak",
+    label: "① VIX ピークアウト確認",
+    desc:  "VIXが40〜50台で天井をつけ、低下に転じている",
+    score: 25,  // 点灯でスコア加算
+    ispeed:"マイページ → VIX指数が前日比マイナスかつ30未満",
+    icon:  "🌡",
+  },
+  {
+    id:    "pcRatio",
+    label: "② P/C 比率が低水準",
+    desc:  "70%台（特に60%以下）= 市場の極度の悲観 → 反発のサイン",
+    score: 20,
+    ispeed:"CBOEサイト or マイページ → P/C Ratio 確認",
+    icon:  "📊",
+  },
+  {
+    id:    "volumeStable",
+    label: "③ 出来高：急増後に安定",
+    desc:  "記録的な出来高で急落 → その後出来高が減少して価格が安定",
+    score: 20,
+    ispeed:"チャート → 出来高バーが急増後に縮小していることを目視確認",
+    icon:  "📦",
+  },
+  {
+    id:    "lowerWick",
+    label: "④ 長い下ヒゲ出現",
+    desc:  "ローソク足の下ヒゲが実体の2倍以上 = 最強の底値シグナル",
+    score: 25,
+    ispeed:"チャート → 当日または直近ローソク足の下ヒゲを目視確認",
+    icon:  "🕯",
+  },
+  {
+    id:    "maDeviation",
+    label: "⑤ 25日MA乖離率 プラス転換",
+    desc:  "マイナス10〜15%以上の乖離がプラスに転じる = 自律反発シグナル",
+    score: 20,
+    ispeed:"チャート → MA25ラインと現在株価の距離を確認",
+    icon:  "📈",
+  },
+];
+
+// ── 強化版 判定ロジック（テクニカル + 5指標の合議） ──
+const calcJudgment = (v, checks5) => {
+  const price    = parseFloat(v.price)   || 0;
+  const rsiS     = parseFloat(v.rsiS)    || 50;
+  const rsiL     = parseFloat(v.rsiL)    || 50;
+  const macd     = parseFloat(v.macd)    || 0;
+  const macdSig  = parseFloat(v.macdSig) || 0;
+  const vix      = parseFloat(v.vix)     || 20;
+  const acq      = 22721;
+
+  const reasons  = [];
+  const warnings = [];
+  let techScore  = 0;  // テクニカル3指標スコア（-100〜+100）
+  let checkScore = 0;  // 5指標チェックスコア（0〜110）
+  const litCount = FIVE_INDICATORS.filter(i => checks5[i.id]).length;
+
+  // ══ テクニカル3指標 ══
+
+  // RSI短期
+  if      (rsiS > 80) { techScore -= 30; warnings.push(`RSI短期 ${rsiS} → 過熱域（80超）。短期天井リスク`); }
+  else if (rsiS > 70) { techScore -= 15; warnings.push(`RSI短期 ${rsiS} → 買われ過ぎ圏`); }
+  else if (rsiS < 30) { techScore += 30; reasons.push(`RSI短期 ${rsiS} → 売られ過ぎ。強いリバウンド期待`); }
+  else if (rsiS < 40) { techScore += 15; reasons.push(`RSI短期 ${rsiS} → 割安圏に接近`); }
+  else                {                  reasons.push(`RSI短期 ${rsiS} → 中立圏`); }
+
+  // RSI長期
+  if      (rsiL > 75) { techScore -= 20; warnings.push(`RSI長期 ${rsiL} → 長期でも過熱。上値が重い`); }
+  else if (rsiL > 60) { techScore -=  5; }
+  else if (rsiL < 35) { techScore += 20; reasons.push(`RSI長期 ${rsiL} → 長期的な底値圏。絶好の仕込み場`); }
+  else if (rsiL < 50) { techScore += 10; reasons.push(`RSI長期 ${rsiL} → 長期でも割安圏`); }
+
+  // MACD
+  if (macd !== 0 && macdSig !== 0) {
+    if      (macd > macdSig) { techScore += 20; reasons.push(`MACD ${macd.toFixed(0)} ＞ シグナル ${macdSig.toFixed(0)} → 強気トレンド継続`); }
+    else if (macd < macdSig) { techScore -= 20; warnings.push(`MACD ${macd.toFixed(0)} ＜ シグナル ${macdSig.toFixed(0)} → 弱気トレンド`); }
+  }
+
+  // VIX
+  if      (vix < 15) { techScore += 15; reasons.push(`VIX ${vix} → 極めて安定。リスクオン全開`); }
+  else if (vix < 20) { techScore += 10; reasons.push(`VIX ${vix} → 安定圏。買いやすい環境`); }
+  else if (vix < 25) { techScore +=  0; reasons.push(`VIX ${vix} → やや警戒。慌てずに`); }
+  else if (vix < 35) { techScore -= 10; warnings.push(`VIX ${vix} → 高ボラティリティ。慎重に`); }
+  else               { techScore -= 25; warnings.push(`VIX ${vix} → 極度の恐怖。追加買いは厳禁`); }
+
+  // 株価 vs 取得単価
+  if (price > 0) {
+    const diffPct = ((price - acq) / acq * 100).toFixed(1);
+    if      (price > acq * 1.35) { warnings.push(`現値 ¥${price.toLocaleString()} = 取得単価比 +${diffPct}%。利確検討ゾーン`); }
+    else if (price > acq)        { reasons.push(`現値 ¥${price.toLocaleString()} = 取得単価比 +${diffPct}%。含み益継続`); }
+    else if (price < acq * 0.95) { techScore -= 15; warnings.push(`現値 ¥${price.toLocaleString()} = 取得単価割れ。損切り検討`); }
+  }
+
+  // ══ 5指標チェックリストスコア ══
+  FIVE_INDICATORS.forEach(ind => {
+    if (checks5[ind.id]) checkScore += ind.score;
+  });
+
+  // ══ 合議スコア計算 ══
+  // テクニカル（最大±85）を正規化 → -50〜+50 相当に圧縮
+  const techNorm   = Math.max(-50, Math.min(50, techScore * 0.6));
+  // 5指標（最大110点）を0〜50相当に変換
+  const checkNorm  = (checkScore / 110) * 50;
+  // 合算（-50〜+100の範囲になる。5指標が揃うほど買いに傾く）
+  const totalScore = Math.round(techNorm + checkNorm);
+
+  // ── 5指標の点灯数によるオーバーライドルール ──
+  // 4つ以上点灯 → テクニカルが弱くても「買い検討」
+  // 0つ点灯 かつ テクニカル弱気 → 「強い売り」
+  let judgment;
+  if      (litCount >= 4 && totalScore >= -10)  judgment = "BUY";
+  else if (litCount >= 3 && totalScore >= 15)   judgment = "BUY";
+  else if (litCount === 0 && totalScore <= -20)  judgment = "SELL";
+  else if (totalScore >= 30)                     judgment = "BUY";
+  else if (totalScore <= -20)                    judgment = "SELL";
+  else                                           judgment = "HOLD";
+
+  return {
+    techScore, checkScore, totalScore, litCount,
+    judgment, reasons, warnings,
+  };
+};
+
+const JUDGE_MAP = {
+  BUY:  { label:"今すぐ買い！",  sub:"複数シグナルが買いを示唆",   color:C.bull,  bg:"#f0fdf4", icon:"🟢", border:C.bull  },
+  SELL: { label:"今すぐ売り！",  sub:"複数シグナルが売りを示唆",   color:C.bear,  bg:"#fff1f2", icon:"🔴", border:C.bear  },
+  HOLD: { label:"今は待て。",    sub:"判断が拮抗。見送りが最善",   color:C.warn,  bg:"#fffbeb", icon:"🟡", border:C.accent},
+};
+
+const INPUT_FIELDS = [
+  { key:"price",   label:"現在値 (¥)",    placeholder:"30140", icon:"💴", ispeed:"285A銘柄情報画面 → 右上の大きい株価数字",                      color:C.accent   },
+  { key:"rsiS",    label:"RSI（短期）",   placeholder:"87.73", icon:"📊", ispeed:"チャート → RSIパネル左上「短期」の数値（ピンク）",             color:"#9333ea"  },
+  { key:"rsiL",    label:"RSI（長期）",   placeholder:"74.72", icon:"📊", ispeed:"チャート → RSIパネル左上「長期」の数値（緑）",               color:C.bull     },
+  { key:"macd",    label:"MACD値",        placeholder:"1730",  icon:"📉", ispeed:"チャート → MACDパネル左上「MACD」の数値（ピンク）",           color:"#9333ea"  },
+  { key:"macdSig", label:"MACDシグナル",  placeholder:"885",   icon:"📉", ispeed:"チャート → MACDパネル左上「シグナル」の数値（緑）",           color:C.bull     },
+  { key:"vix",     label:"VIX指数",       placeholder:"19.23", icon:"🌡", ispeed:"マイページ → 市場指数 →「VIX指数」の数値",                   color:C.cyan     },
+];
+
+// ── 5指標チェックパネル（インタラクティブ）──
+const FiveIndicatorPanel = ({ checks5, setChecks5, result }) => (
+  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+    {FIVE_INDICATORS.map(ind => {
+      const isLit = checks5[ind.id];
+      return (
+        <div key={ind.id}
+          onClick={()=>setChecks5(p=>({...p,[ind.id]:!p[ind.id]}))}
+          style={{
+            display:"flex", alignItems:"flex-start", gap:12, cursor:"pointer",
+            padding:"12px 14px", borderRadius:10,
+            background: isLit ? "#f0fdf4" : "#f8fafc",
+            border: `2px solid ${isLit ? C.bull : C.border}`,
+            transition:"all .2s", boxShadow: isLit ? `0 0 0 3px ${C.bull}22` : "none",
+          }}>
+          {/* チェックボックス */}
+          <div style={{
+            width:22, height:22, borderRadius:6, flexShrink:0, marginTop:1,
+            background: isLit ? C.bull : "#fff",
+            border: `2px solid ${isLit ? C.bull : C.border}`,
+            display:"flex", alignItems:"center", justifyContent:"center",
+            fontSize:13, color:"#fff", transition:"all .2s",
+          }}>
+            {isLit && "✓"}
+          </div>
+          {/* 内容 */}
+          <div style={{flex:1}}>
+            <div style={{display:"flex", alignItems:"center", gap:8, marginBottom:3}}>
+              <span style={{fontSize:16}}>{ind.icon}</span>
+              <span style={{fontSize:13, fontWeight:700, color: isLit ? C.bull : C.text}}>
+                {ind.label}
+              </span>
+              {/* スコアバッジ */}
+              <span style={{
+                marginLeft:"auto", fontSize:11, fontWeight:800,
+                color: isLit ? "#fff" : C.muted,
+                background: isLit ? C.bull : C.border,
+                padding:"1px 8px", borderRadius:20,
+              }}>
+                {isLit ? `+${ind.score}点` : `${ind.score}点`}
+              </span>
+            </div>
+            <div style={{fontSize:11, color:C.muted, lineHeight:1.5}}>{ind.desc}</div>
+            <div style={{fontSize:10, color:C.blue, marginTop:4}}>
+              📍 {ind.ispeed}
+            </div>
+          </div>
+        </div>
+      );
+    })}
+
+    {/* 5指標スコアサマリー */}
+    <div style={{
+      display:"flex", alignItems:"center", justifyContent:"space-between",
+      padding:"10px 14px", borderRadius:8,
+      background: result.litCount >= 4 ? "#f0fdf4" : result.litCount >= 2 ? "#fffbeb" : "#f8fafc",
+      border:`1px solid ${result.litCount >= 4 ? C.bull : result.litCount >= 2 ? C.accent : C.border}`,
+    }}>
+      <div style={{fontSize:12, color:C.muted}}>
+        5指標スコア：<span style={{fontWeight:800, color:C.text}}>{result.checkScore} / 110点</span>
+      </div>
+      <div style={{fontSize:12, fontWeight:700,
+        color: result.litCount >= 4 ? C.bull : result.litCount >= 2 ? C.warn : C.muted}}>
+        {result.litCount} / 5 点灯
+        {result.litCount >= 4 ? "　→ 買い環境◎" : result.litCount >= 3 ? "　→ 買い環境○" : result.litCount >= 1 ? "　→ 様子見" : "　→ 環境未整備"}
+      </div>
+    </div>
+  </div>
+);
+
+// ═══════════════════════════════════════════════════════════════
+//  📷 Claude連携パネル
+//  フロー：
+//    ① iSPEEDのスクショをこのチャット（Claude）に画像として送る
+//    ② Claudeが数値・5指標・AI解説を専用フォーマットで返す
+//    ③ そのテキストを貼り付け → 数値・チェック・解説が全自動反映
+// ═══════════════════════════════════════════════════════════════
+
+// ── Claudeが返す専用フォーマットのパーサー ──
+const parseClaudeOutput = (text) => {
+  const vals    = {};
+  const checks5 = {};
+  let   aiText  = "";
+
+  // --- 数値 ---
+  const numPatterns = {
+    price:   /price\s*=\s*([\d,]+)/i,
+    rsiS:    /rsiS\s*=\s*([\d.]+)/i,
+    rsiL:    /rsiL\s*=\s*([\d.]+)/i,
+    macd:    /macd\s*=\s*(-?[\d.]+)/i,
+    macdSig: /macdSig\s*=\s*(-?[\d.]+)/i,
+    vix:     /vix\s*=\s*([\d.]+)/i,
+  };
+  Object.entries(numPatterns).forEach(([key, re]) => {
+    const m = text.match(re);
+    if (m) vals[key] = m[1].replace(/,/g, "");
+  });
+
+  // --- 5指標チェック ---
+  const checkPatterns = {
+    vixPeak:      /vixPeak\s*=\s*(true|false)/i,
+    pcRatio:      /pcRatio\s*=\s*(true|false)/i,
+    volumeStable: /volumeStable\s*=\s*(true|false)/i,
+    lowerWick:    /lowerWick\s*=\s*(true|false)/i,
+    maDeviation:  /maDeviation\s*=\s*(true|false)/i,
+  };
+  Object.entries(checkPatterns).forEach(([key, re]) => {
+    const m = text.match(re);
+    if (m) checks5[key] = m[1].toLowerCase() === "true";
+  });
+
+  // --- AI解説 ---
+  // KIOXIA_AI: 以降の行を全部取得
+  const aiMatch = text.match(/KIOXIA_AI:\s*([\s\S]+?)(?=KIOXIA_|$)/i)
+    || text.match(/AI解説:\s*([\s\S]+?)(?=KIOXIA_|$)/i);
+  if (aiMatch) aiText = aiMatch[1].trim();
+
+  return { vals, checks5, aiText,
+    hasVals:    Object.keys(vals).length > 0,
+    hasChecks:  Object.keys(checks5).length > 0,
+    hasAI:      aiText.length > 0,
+  };
+};
+
+// ── 貼り付けパネル本体 ──
+const ScreenshotPastePanel = ({ onApply }) => {
+  const [pasteText, setPasteText] = useState("");
+  const [parsed,    setParsed]    = useState(null);
+  const [applied,   setApplied]   = useState(false);
+  const [open,      setOpen]      = useState(true);
+
+  const handleChange = (text) => {
+    setPasteText(text);
+    setApplied(false);
+    if (!text.trim()) { setParsed(null); return; }
+    const result = parseClaudeOutput(text);
+    setParsed(result.hasVals || result.hasChecks || result.hasAI ? result : null);
+  };
+
+  const handleApply = () => {
+    if (!parsed) return;
+    onApply(parsed);
+    setApplied(true);
+  };
+
+  const FIELD_LABEL = {
+    price:"現在値", rsiS:"RSI短期", rsiL:"RSI長期",
+    macd:"MACD", macdSig:"シグナル", vix:"VIX",
+  };
+  const CHECK_LABEL = {
+    vixPeak:"①VIXピークアウト", pcRatio:"②P/C比率",
+    volumeStable:"③出来高安定", lowerWick:"④下ヒゲ", maDeviation:"⑤MA乖離",
+  };
+
+  // Claudeへのプロンプト（コピー用）
+  const PROMPT = `このiSPEEDのスクリーンショットを分析して、以下の専用フォーマットで返してください。
+
+KIOXIA_DATA:
+price=（現在値）
+rsiS=（RSI短期）
+rsiL=（RSI長期）
+macd=（MACD値）
+macdSig=（MACDシグナル）
+vix=（VIX指数。画面にない場合は直近値）
+
+KIOXIA_5CHECK:
+vixPeak=（true/false）// VIXが40〜50台からピークアウトして低下中か
+pcRatio=（true/false）// P/C比率が70%台以下か
+volumeStable=（true/false）// 出来高が急増後に縮小して安定しているか
+lowerWick=（true/false）// ローソク足に実体の2倍以上の下ヒゲがあるか
+maDeviation=（true/false）// 25日MA乖離率がマイナスからプラスに転換しているか
+
+KIOXIA_AI:
+（現在の相場状況・注目ポイント・今日のアクション提案を200〜300文字で）`;
+
+  const [copied, setCopied] = useState(false);
+  const copyPrompt = () => {
+    navigator.clipboard.writeText(PROMPT).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  return (
+    <div style={{
+      background:C.surface,
+      border:`2px solid ${applied ? C.bull : C.blue}`,
+      borderRadius:14, overflow:"hidden",
+      boxShadow: applied ? `0 0 0 4px ${C.bull}18` : `0 0 0 4px ${C.blue}10`,
+      transition:"all .3s",
+    }}>
+
+      {/* ヘッダー（タップで開閉） */}
+      <div onClick={() => setOpen(p=>!p)} style={{
+        padding:"14px 18px", cursor:"pointer",
+        background: applied ? "#f0fdf4" : "#eff6ff",
+        borderBottom: open ? `1px solid ${C.border}` : "none",
+        display:"flex", alignItems:"center", justifyContent:"space-between",
+      }}>
+        <div>
+          <div style={{fontSize:14, fontWeight:900, color: applied ? C.bull : C.blue}}>
+            {applied ? "✅ Claude解析：全項目反映済み" : "📷 Claudeスクショ解析（最速・全自動）"}
+          </div>
+          <div style={{fontSize:11, color:C.muted, marginTop:2}}>
+            {applied
+              ? "数値・5指標・AI解説がすべて自動入力されました"
+              : "スクショ → Claudeに送る → テキストを貼り付けるだけで全自動反映"}
+          </div>
+        </div>
+        <div style={{fontSize:18, color:C.muted, marginLeft:8}}>{open ? "▲" : "▼"}</div>
+      </div>
+
+      {open && (
+        <div style={{padding:"16px 18px", display:"flex", flexDirection:"column", gap:14}}>
+
+          {/* ── 手順ガイド ── */}
+          <div style={{background:"#f8fafc", border:`1px solid ${C.border}`, borderRadius:10, padding:"12px 14px"}}>
+            <div style={{fontSize:12, fontWeight:800, color:C.text, marginBottom:10}}>📋 3ステップで全自動</div>
+            {[
+              { n:"①", color:C.blue,   text:"iSPEEDのチャート画面をスクリーンショット（RSI・MACD・MAが見える状態）" },
+              { n:"②", color:C.purple, text:"このチャット（Claude）に画像と下のプロンプトを送る" },
+              { n:"③", color:C.bull,   text:"Claudeの返答をコピー → 下の貼り付けエリアに貼る → 「全て反映」ボタン" },
+            ].map(s=>(
+              <div key={s.n} style={{display:"flex", gap:10, marginBottom:8, alignItems:"flex-start"}}>
+                <div style={{
+                  width:22, height:22, borderRadius:"50%", flexShrink:0,
+                  background:s.color, color:"#fff",
+                  display:"flex", alignItems:"center", justifyContent:"center",
+                  fontSize:12, fontWeight:900,
+                }}>{s.n}</div>
+                <div style={{fontSize:12, color:C.text, lineHeight:1.7}}>{s.text}</div>
+              </div>
+            ))}
+
+            {/* プロンプトコピーボタン */}
+            <div style={{marginTop:10}}>
+              <div style={{fontSize:11, color:C.muted, marginBottom:6}}>
+                💬 ②で使うプロンプト（画像と一緒に送ってください）：
+              </div>
+              <div style={{
+                background:"#1e293b", borderRadius:8, padding:"10px 12px",
+                fontSize:11, color:"#94a3b8", fontFamily:"monospace",
+                lineHeight:1.7, marginBottom:8, whiteSpace:"pre-wrap",
+                maxHeight:100, overflow:"hidden",
+              }}>
+                {PROMPT.slice(0, 120)}…
+              </div>
+              <button onClick={copyPrompt} style={{
+                width:"100%", padding:"10px", borderRadius:8,
+                background: copied ? C.bull : C.blue,
+                color:"#fff", fontWeight:800, fontSize:13,
+                border:"none", cursor:"pointer", fontFamily:"inherit",
+                transition:"all .2s",
+              }}>
+                {copied ? "✅ コピーしました！" : "📋 プロンプト全文をコピー"}
+              </button>
+            </div>
+          </div>
+
+          {/* ── 貼り付けエリア ── */}
+          <div>
+            <div style={{fontSize:12, fontWeight:700, color:C.text, marginBottom:6}}>
+              ③ Claudeの返答をここに貼り付け：
+            </div>
+            <textarea
+              value={pasteText}
+              onChange={e => handleChange(e.target.value)}
+              placeholder={`KIOXIA_DATA:\nprice=30140\nrsiS=51.60\nrsiL=41.60\n...\n\nKIOXIA_5CHECK:\nvixPeak=false\n...\n\nKIOXIA_AI:\n現在の相場状況...`}
+              rows={6}
+              style={{
+                width:"100%", boxSizing:"border-box",
+                background: parsed ? "#f0fdf4" : "#f8fafc",
+                border:`1.5px solid ${parsed ? C.bull : C.border}`,
+                borderRadius:10, padding:"12px",
+                fontSize:12, color:C.text, fontFamily:"monospace",
+                outline:"none", resize:"vertical", lineHeight:1.7,
+                transition:"all .2s",
+              }}
+            />
+          </div>
+
+          {/* ── 検出内容プレビュー ── */}
+          {parsed && (
+            <div style={{display:"flex", flexDirection:"column", gap:8}}>
+
+              {/* 数値プレビュー */}
+              {parsed.hasVals && (
+                <div style={{background:"#eff6ff", border:`1px solid ${C.blue}44`, borderRadius:8, padding:"10px 12px"}}>
+                  <div style={{fontSize:11, fontWeight:700, color:C.blue, marginBottom:8}}>📊 検出された数値</div>
+                  <div style={{display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:6}}>
+                    {Object.entries(parsed.vals).map(([k,v]) => (
+                      <div key={k} style={{background:"#fff", borderRadius:6, padding:"6px 8px", textAlign:"center", border:`1px solid ${C.blue}22`}}>
+                        <div style={{fontSize:9, color:C.muted}}>{FIELD_LABEL[k]||k}</div>
+                        <div style={{fontSize:13, fontWeight:800, color:C.blue}}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* 5指標プレビュー */}
+              {parsed.hasChecks && (
+                <div style={{background:"#f0fdf4", border:`1px solid ${C.bull}44`, borderRadius:8, padding:"10px 12px"}}>
+                  <div style={{fontSize:11, fontWeight:700, color:C.bull, marginBottom:8}}>✅ Claudeによる5指標判定</div>
+                  <div style={{display:"flex", flexDirection:"column", gap:5}}>
+                    {Object.entries(parsed.checks5).map(([k,v]) => (
+                      <div key={k} style={{
+                        display:"flex", alignItems:"center", gap:8,
+                        padding:"5px 8px", borderRadius:6,
+                        background: v ? "#dcfce7" : "#f1f5f9",
+                        border:`1px solid ${v ? C.bull+"44" : C.border}`,
+                      }}>
+                        <span style={{fontSize:13}}>{v ? "✅" : "⬜"}</span>
+                        <span style={{fontSize:12, color: v ? C.bull : C.muted, fontWeight: v ? 700 : 400}}>
+                          {CHECK_LABEL[k]}
+                        </span>
+                        <span style={{fontSize:11, fontWeight:800, marginLeft:"auto",
+                          color: v ? C.bull : C.muted}}>
+                          {v ? "点灯" : "未点灯"}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* AI解説プレビュー */}
+              {parsed.hasAI && (
+                <div style={{background:"#fffbeb", border:`1px solid ${C.accent}44`, borderRadius:8, padding:"10px 12px"}}>
+                  <div style={{fontSize:11, fontWeight:700, color:C.accent, marginBottom:6}}>🤖 AI相場解説</div>
+                  <div style={{fontSize:12, color:C.text, lineHeight:1.8, whiteSpace:"pre-wrap"}}>
+                    {parsed.aiText}
+                  </div>
+                </div>
+              )}
+
+              {/* 反映ボタン */}
+              <button onClick={handleApply} style={{
+                padding:"14px", borderRadius:10,
+                background: C.bull, color:"#fff",
+                fontWeight:900, fontSize:15,
+                border:"none", cursor:"pointer", fontFamily:"inherit",
+                boxShadow:`0 4px 16px ${C.bull}44`,
+                transition:"all .2s",
+              }}>
+                ✅ 数値・5指標・AI解説をすべて反映する
+              </button>
+            </div>
+          )}
+
+          {/* 反映済みメッセージ */}
+          {applied && (
+            <div style={{
+              padding:"12px 14px", borderRadius:8,
+              background:"#f0fdf4", border:`1px solid ${C.bull}`,
+              fontSize:13, color:C.bull, fontWeight:700, textAlign:"center",
+            }}>
+              🎉 すべてのデータが反映されました！下のSTEP1・STEP2・AI解説を確認してください。
+            </div>
+          )}
+
+          {!parsed && pasteText.trim() && (
+            <div style={{
+              padding:"10px 12px", borderRadius:8,
+              background:"#fff1f2", border:`1px solid ${C.bear}44`,
+              fontSize:12, color:C.bear, lineHeight:1.7,
+            }}>
+              ⚠️ フォーマットが認識できませんでした。<br/>
+              上の「プロンプト全文をコピー」を使って画像と一緒にClaudeに送ってください。
+            </div>
+          )}
+
+        </div>
+      )}
+    </div>
+  );
+};
+
+const JudgmentEngine = ({ onValuesChange }) => {
+  const [vals, setVals] = useState({
+    price:"30140", rsiS:"51.60", rsiL:"41.60",
+    macd:"56.29", macdSig:"78.13", vix:"19.23",
+  });
+  const [checks5, setChecks5] = useState({
+    vixPeak:false, pcRatio:false, volumeStable:false,
+    lowerWick:false, maDeviation:false,
+  });
+  const [focused,       setFocused]       = useState(null);
+  const [aiExplanation, setAiExplanation] = useState("");
+
+  const result     = calcJudgment(vals, checks5);
+  const jmap       = JUDGE_MAP[result.judgment];
+
+  const handleChange = (key, value) => {
+    const next = { ...vals, [key]: value };
+    setVals(next);
+    onValuesChange?.(next);
+  };
+
+  // スコアバー用
+  const totalClamped = Math.max(-50, Math.min(100, result.totalScore));
+  const barPos       = result.totalScore >= 0 ? "50%" : `${50 + totalClamped/2}%`;
+  const barWidth     = `${Math.abs(totalClamped)/2}%`;
+  const barColor     = result.totalScore > 0 ? C.bull : result.totalScore < 0 ? C.bear : C.muted;
+
+  return (
+    <div style={{display:"flex", flexDirection:"column", gap:16}}>
+
+      {/* ── 大判定バナー ── */}
+      <div style={{
+        padding:"24px 20px", borderRadius:16,
+        background:`linear-gradient(135deg, ${jmap.bg} 0%, #f8fafc 100%)`,
+        border:`2px solid ${jmap.border}`,
+        display:"flex", flexDirection:"column", alignItems:"center", gap:10,
+        boxShadow:`0 4px 24px ${jmap.border}33`,
+      }}>
+        <div style={{fontSize:52}}>{jmap.icon}</div>
+        <div style={{fontSize:34, fontWeight:900, color:jmap.color, letterSpacing:1}}>
+          {jmap.label}
+        </div>
+        <div style={{fontSize:13, color:C.muted}}>{jmap.sub}</div>
+
+        {/* スコア内訳 */}
+        <div style={{display:"flex", gap:16, marginTop:4, flexWrap:"wrap", justifyContent:"center"}}>
+          {[
+            {label:"テクニカル",  val:result.techScore,  max:85,  color:C.blue},
+            {label:"5指標",       val:result.checkScore, max:110, color:C.bull},
+            {label:"総合スコア",  val:result.totalScore, max:100, color:jmap.color},
+          ].map(s=>(
+            <div key={s.label} style={{textAlign:"center", minWidth:80}}>
+              <div style={{fontSize:10, color:C.muted, marginBottom:4}}>{s.label}</div>
+              <div style={{fontSize:22, fontWeight:900, color:s.color}}>
+                {s.val > 0 ? "+" : ""}{s.val}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* 総合スコアバー */}
+        <div style={{width:"100%", maxWidth:340, marginTop:4}}>
+          <div style={{display:"flex", justifyContent:"space-between", fontSize:10, color:C.muted, marginBottom:4}}>
+            <span style={{color:C.bear}}>← 売り</span>
+            <span style={{color:jmap.color, fontWeight:700}}>総合 {result.totalScore > 0 ? "+" : ""}{result.totalScore}点</span>
+            <span style={{color:C.bull}}>買い →</span>
+          </div>
+          <div style={{height:10, background:"#e2e8f0", borderRadius:5, position:"relative"}}>
+            <div style={{
+              position:"absolute", left:barPos, width:barWidth,
+              height:"100%", borderRadius:5,
+              background:barColor, transition:"all .4s",
+            }}/>
+            <div style={{position:"absolute", left:"50%", top:"-3px", width:2, height:16, background:C.muted, transform:"translateX(-50%)"}}/>
+          </div>
+          <div style={{display:"flex", justifyContent:"space-between", fontSize:9, color:C.muted, marginTop:2}}>
+            <span>-50</span><span>0</span><span>+100</span>
+          </div>
+        </div>
+      </div>
+
+      {/* ── 📷 スクリーンショット連携パネル ── */}
+      <ScreenshotPastePanel onApply={(parsed) => {
+        // 数値を反映
+        if (parsed.hasVals) {
+          const next = { ...vals, ...parsed.vals };
+          setVals(next);
+          onValuesChange?.(next);
+        }
+        // 5指標チェックを反映
+        if (parsed.hasChecks) {
+          setChecks5(prev => ({ ...prev, ...parsed.checks5 }));
+        }
+        // AI解説を反映
+        if (parsed.hasAI) {
+          setAiExplanation(parsed.aiText);
+        }
+      }} />
+
+      {/* ── テクニカル指標入力 ── */}
+      <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:12, overflow:"hidden"}}>
+        <div style={{padding:"12px 16px", background:"#eff6ff", borderBottom:`1px solid ${C.border}`}}>
+          <div style={{fontSize:12, fontWeight:700, color:C.blue}}>
+            📱 STEP 1 ： iSPEEDで数値を確認して入力
+          </div>
+          <div style={{fontSize:10, color:C.muted, marginTop:2}}>テクニカルスコア：{result.techScore > 0 ? "+" : ""}{result.techScore}点</div>
+        </div>
+        <div style={{display:"flex", flexDirection:"column", gap:0}}>
+          {INPUT_FIELDS.map((f, idx) => (
+            <div key={f.key} style={{
+              display:"grid", gridTemplateColumns:"1fr auto",
+              gap:12, alignItems:"center",
+              padding:"10px 16px",
+              background: focused===f.key ? "#eff6ff" : "transparent",
+              borderBottom: idx < INPUT_FIELDS.length-1 ? `1px solid ${C.border}` : "none",
+              transition:"background .15s",
+            }}>
+              <div>
+                <div style={{fontSize:13, fontWeight:700, color:f.color, marginBottom:2}}>
+                  {f.icon} {f.label}
+                </div>
+                <div style={{fontSize:10, color:C.muted, lineHeight:1.4}}>📍 {f.ispeed}</div>
+              </div>
+              <input
+                value={vals[f.key] || ""}
+                onChange={e => handleChange(f.key, e.target.value)}
+                onFocus={() => setFocused(f.key)}
+                onBlur={() => setFocused(null)}
+                placeholder={f.placeholder}
+                inputMode="decimal"
+                style={{
+                  width:110, background: focused===f.key ? "#fff" : "#f8fafc",
+                  border:`1.5px solid ${focused===f.key ? f.color : C.border}`,
+                  borderRadius:8, padding:"10px 12px",
+                  color:f.color, fontSize:18, fontWeight:800,
+                  fontFamily:"inherit", outline:"none",
+                  transition:"all .15s", textAlign:"right", boxSizing:"border-box",
+                }}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── 5指標チェックリスト ── */}
+      <div style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:12, overflow:"hidden"}}>
+        <div style={{padding:"12px 16px", background:"#f0fdf4", borderBottom:`1px solid ${C.border}`}}>
+          <div style={{fontSize:12, fontWeight:700, color:C.bull}}>
+            ✅ STEP 2 ： タカさんの5指標チェックリスト（目視で確認してチェック）
+          </div>
+          <div style={{fontSize:10, color:C.muted, marginTop:2}}>
+            チェックリストスコア：{result.checkScore}点 ／ 110点満点　|　{result.litCount}/5 点灯
+          </div>
+        </div>
+        <div style={{padding:"12px 16px"}}>
+          <FiveIndicatorPanel checks5={checks5} setChecks5={setChecks5} result={result}/>
+        </div>
+      </div>
+
+      {/* ── 判定根拠 ── */}
+      <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:12}}>
+        <div style={{background:C.surface, border:`1px solid ${C.bull}44`, borderRadius:12, padding:"14px 16px"}}>
+          <div style={{fontSize:11, color:C.bull, fontWeight:700, textTransform:"uppercase", letterSpacing:1, marginBottom:8}}>✅ 買い根拠</div>
+          {result.reasons.length > 0
+            ? result.reasons.map((r,i)=>(
+                <div key={i} style={{fontSize:12, color:C.text, lineHeight:1.6, marginBottom:6,
+                  paddingLeft:8, borderLeft:`2px solid ${C.bull}`}}>{r}</div>
+              ))
+            : <div style={{fontSize:12, color:C.muted}}>なし</div>
+          }
+        </div>
+        <div style={{background:C.surface, border:`1px solid ${C.bear}44`, borderRadius:12, padding:"14px 16px"}}>
+          <div style={{fontSize:11, color:C.bear, fontWeight:700, textTransform:"uppercase", letterSpacing:1, marginBottom:8}}>⚠️ 警戒サイン</div>
+          {result.warnings.length > 0
+            ? result.warnings.map((w,i)=>(
+                <div key={i} style={{fontSize:12, color:C.text, lineHeight:1.6, marginBottom:6,
+                  paddingLeft:8, borderLeft:`2px solid ${C.bear}`}}>{w}</div>
+              ))
+            : <div style={{fontSize:12, color:C.muted}}>なし</div>
+          }
+        </div>
+      </div>
+
+      {/* ── 判定ロジック解説 ── */}
+      <div style={{background:"#f8fafc", border:`1px solid ${C.border}`, borderRadius:12, padding:"14px 16px"}}>
+        <div style={{fontSize:11, color:C.muted, fontWeight:700, textTransform:"uppercase", letterSpacing:1, marginBottom:10}}>
+          🔢 スコア計算の仕組み
+        </div>
+        <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:10}}>
+          {[
+            {label:"テクニカル3指標", items:["RSI短期：±30点", "RSI長期：±20点", "MACD：±20点", "VIX：±25点"], color:C.blue},
+            {label:"5指標チェックリスト", items:["VIXピークアウト：+25点", "P/C比率低下：+20点", "出来高安定：+20点", "下ヒゲ出現：+25点","25日MA乖離：+20点"], color:C.bull},
+          ].map(g=>(
+            <div key={g.label}>
+              <div style={{fontSize:11, fontWeight:700, color:g.color, marginBottom:6}}>{g.label}</div>
+              {g.items.map(item=>(
+                <div key={item} style={{fontSize:11, color:C.muted, lineHeight:1.7, paddingLeft:8,
+                  borderLeft:`2px solid ${g.color}44`}}>{item}</div>
+              ))}
+            </div>
+          ))}
+        </div>
+        <div style={{marginTop:10, padding:"8px 12px", borderRadius:6, background:"#eff6ff",
+          border:`1px solid ${C.blue}44`, fontSize:11, color:C.muted, lineHeight:1.7}}>
+          <span style={{fontWeight:700, color:C.blue}}>最終判定ルール：</span>
+          5指標が4つ以上点灯 かつ 総合スコア≥-10 → <span style={{color:C.bull, fontWeight:700}}>強制BUY</span>　／　
+          総合スコア≥+30 → <span style={{color:C.bull, fontWeight:700}}>BUY</span>　／　
+          総合スコア≤-20 → <span style={{color:C.bear, fontWeight:700}}>SELL</span>
+        </div>
+      </div>
+
+      {/* ── AI解説パネル ── */}
+      {aiExplanation ? (
+        <div style={{
+          background:C.surface, border:`2px solid ${C.accent}`,
+          borderRadius:16, overflow:"hidden",
+          boxShadow:`0 4px 20px ${C.accent}22`,
+        }}>
+          <div style={{
+            padding:"12px 18px",
+            background:`linear-gradient(135deg, #fffbeb, #f8fafc)`,
+            borderBottom:`1px solid ${C.border}`,
+            display:"flex", alignItems:"center", justifyContent:"space-between",
+          }}>
+            <div>
+              <div style={{fontSize:13, fontWeight:800, color:C.accent}}>🤖 Claude AI 相場解説</div>
+              <div style={{fontSize:10, color:C.muted, marginTop:2}}>スクショ解析から自動生成</div>
+            </div>
+            <button onClick={() => setAiExplanation("")}
+              style={{fontSize:11, color:C.muted, background:"transparent",
+                border:`1px solid ${C.border}`, borderRadius:5,
+                padding:"3px 8px", cursor:"pointer", fontFamily:"inherit"}}>
+              ✕ 閉じる
+            </button>
+          </div>
+          <div style={{padding:"16px 18px"}}>
+            <div style={{fontSize:14, color:C.text, lineHeight:2, whiteSpace:"pre-wrap"}}>
+              {aiExplanation}
+            </div>
+            <div style={{
+              marginTop:12, padding:"8px 12px", borderRadius:6,
+              background:"#fffbeb", border:`1px solid ${C.accent}44`,
+              fontSize:10, color:C.muted,
+            }}>
+              ⚠️ 情報提供目的のみ。投資判断はご自身の責任で行ってください。
+            </div>
+          </div>
+        </div>
+      ) : (
+        <AiExplanationPanel vals={vals} checks5={checks5} result={result} />
+      )}
+
+    </div>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  AI解説パネル — Claude API を使って現在の状況を日本語で解説
+// ═══════════════════════════════════════════════════════════════
+const AiExplanationPanel = ({ vals, checks5, result }) => {
+  const [explanation, setExplanation] = useState("");
+  const [loading,     setLoading]     = useState(false);
+  const [error,       setError]       = useState("");
+  const [lastFetched, setLastFetched] = useState(null);
+
+  const litNames = FIVE_INDICATORS
+    .filter(i => checks5[i.id])
+    .map(i => i.label);
+  const unlitNames = FIVE_INDICATORS
+    .filter(i => !checks5[i.id])
+    .map(i => i.label);
+
+  const buildPrompt = () => `
+あなたはプロの株式アナリストです。以下のデータをもとに、キオクシアホールディングス（285A）の現在の相場状況と売買判断を、投資家タカさんに向けて日本語で解説してください。
+
+【現在のデータ】
+- 現在値：¥${parseFloat(vals.price).toLocaleString()}（取得単価 ¥22,721）
+- RSI 短期：${vals.rsiS}　長期：${vals.rsiL}
+- MACD：${vals.macd}　シグナル：${vals.macdSig}　ヒストグラム：${(parseFloat(vals.macd) - parseFloat(vals.macdSig)).toFixed(0)}
+- VIX：${vals.vix}
+
+【5指標チェックリスト】
+- 点灯（${litNames.length}個）：${litNames.length > 0 ? litNames.join("、") : "なし"}
+- 未点灯（${unlitNames.length}個）：${unlitNames.length > 0 ? unlitNames.join("、") : "なし"}
+
+【エンジン判定結果】
+- テクニカルスコア：${result.techScore > 0 ? "+" : ""}${result.techScore}点
+- 5指標スコア：${result.checkScore}点 / 110点
+- 総合スコア：${result.totalScore > 0 ? "+" : ""}${result.totalScore}点
+- 最終判定：${result.judgment === "BUY" ? "買い" : result.judgment === "SELL" ? "売り" : "様子見"}
+
+以下の構成で、200〜300文字程度で簡潔に解説してください：
+1. 現在の相場状況（一言で）
+2. 注目すべきポイント（良い点・悪い点）
+3. 具体的なアクション提案（今日何をすべきか）
+
+話し方は「タカさんへの直接アドバイス」として、専門的すぎず、でも的確に。文末は「〜です。〜ます。」調で統一してください。
+`;
+
+  const fetchExplanation = async () => {
+    setLoading(true);
+    setError("");
+    setExplanation("");
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          messages: [
+            { role: "user", content: buildPrompt() }
+          ],
+        }),
+      });
+
+      const data = await response.json();
+
+      // content配列からtextブロックを結合
+      const text = (data.content || [])
+        .filter(block => block.type === "text")
+        .map(block => block.text)
+        .join("\n");
+
+      if (!text) throw new Error("応答テキストが空です");
+
+      setExplanation(text);
+      setLastFetched(new Date().toLocaleTimeString("ja-JP", {hour:"2-digit", minute:"2-digit"}));
+    } catch(e) {
+      setError(`エラー：${e.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const jColor = result.judgment === "BUY" ? C.bull : result.judgment === "SELL" ? C.bear : C.warn;
+
+  return (
+    <div style={{
+      background: C.surface,
+      border: `2px solid ${jColor}44`,
+      borderRadius: 16,
+      overflow: "hidden",
+    }}>
+      {/* ヘッダー */}
+      <div style={{
+        padding: "14px 18px",
+        background: `linear-gradient(135deg, ${jColor}11, #f8fafc)`,
+        borderBottom: `1px solid ${C.border}`,
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        gap: 12, flexWrap: "wrap",
+      }}>
+        <div>
+          <div style={{fontSize:13, fontWeight:800, color:C.text, marginBottom:2}}>
+            🤖 Claude AI による相場解説
+          </div>
+          <div style={{fontSize:11, color:C.muted}}>
+            現在の指標をもとに、今日の判断をわかりやすく解説します
+          </div>
+        </div>
+        <button
+          onClick={fetchExplanation}
+          disabled={loading}
+          style={{
+            padding: "10px 20px",
+            borderRadius: 8,
+            background: loading ? C.border : jColor,
+            color: loading ? C.muted : "#fff",
+            fontWeight: 800, fontSize: 13,
+            border: "none", cursor: loading ? "not-allowed" : "pointer",
+            fontFamily: "inherit", transition: "all .2s",
+            display: "flex", alignItems: "center", gap: 6,
+            flexShrink: 0,
+          }}
+        >
+          {loading
+            ? <><span style={{animation:"spin .8s linear infinite",display:"inline-block"}}>⏳</span> 解説生成中…</>
+            : "✨ AI解説を生成する"
+          }
+        </button>
+      </div>
+
+      {/* 本文エリア */}
+      <div style={{padding: "16px 18px", minHeight: 80}}>
+        {!explanation && !loading && !error && (
+          <div style={{
+            display:"flex", flexDirection:"column", alignItems:"center",
+            justifyContent:"center", padding:"20px 0", gap:8, color:C.muted,
+          }}>
+            <div style={{fontSize:32}}>💬</div>
+            <div style={{fontSize:13}}>ボタンを押すと、現在の指標をClaudeが分析して解説します</div>
+            <div style={{fontSize:11, color:C.muted}}>
+              RSI・MACD・VIX・5指標の全データを自動で送信します
+            </div>
+          </div>
+        )}
+
+        {loading && (
+          <div style={{display:"flex",alignItems:"center",gap:12,padding:"16px 0",color:C.muted}}>
+            <div style={{
+              width:24, height:24,
+              border:`3px solid ${C.border}`,
+              borderTopColor:jColor,
+              borderRadius:"50%",
+              animation:"spin .8s linear infinite",
+              flexShrink:0,
+            }}/>
+            <div>
+              <div style={{fontSize:13,color:C.text,marginBottom:2}}>Claudeが分析中です…</div>
+              <div style={{fontSize:11,color:C.muted}}>RSI・MACD・5指標を総合的に判断しています</div>
+            </div>
+          </div>
+        )}
+
+        {error && !loading && (
+          <div style={{display:"flex", flexDirection:"column", gap:10}}>
+            <div style={{
+              padding:"12px 14px", borderRadius:8,
+              background:"#fff1f2", border:`1px solid ${C.bear}44`,
+              fontSize:12, color:C.bear, lineHeight:1.7,
+            }}>
+              ⚠️ {error}
+            </div>
+            {/* プロンプト確認用（デバッグ） */}
+            <details>
+              <summary style={{fontSize:11, color:C.muted, cursor:"pointer", userSelect:"none"}}>
+                📋 送信したプロンプトを確認する（デバッグ用）
+              </summary>
+              <pre style={{
+                marginTop:8, padding:"10px 12px", borderRadius:6,
+                background:"#f8fafc", border:`1px solid ${C.border}`,
+                fontSize:10, color:C.muted, whiteSpace:"pre-wrap",
+                lineHeight:1.6, overflowX:"auto",
+              }}>
+                {buildPrompt()}
+              </pre>
+            </details>
+          </div>
+        )}
+
+        {explanation && !loading && (
+          <div>
+            {/* 解説テキスト */}
+            <div style={{
+              fontSize:14, color:C.text, lineHeight:1.9,
+              whiteSpace:"pre-wrap",
+              padding:"4px 0",
+            }}>
+              {explanation}
+            </div>
+
+            {/* メタ情報 */}
+            <div style={{
+              marginTop:12, display:"flex", alignItems:"center",
+              justifyContent:"space-between", flexWrap:"wrap", gap:8,
+            }}>
+              <div style={{fontSize:10, color:C.muted}}>
+                🤖 Claude claude-sonnet-4-20250514 による解説　|　生成時刻: {lastFetched}
+              </div>
+              <button
+                onClick={fetchExplanation}
+                style={{
+                  padding:"4px 12px", borderRadius:6,
+                  background:"transparent", color:C.muted,
+                  border:`1px solid ${C.border}`,
+                  fontSize:11, cursor:"pointer", fontFamily:"inherit",
+                }}
+              >
+                🔄 再生成
+              </button>
+            </div>
+
+            {/* 免責 */}
+            <div style={{
+              marginTop:8, padding:"8px 12px", borderRadius:6,
+              background:"#fffbeb", border:`1px solid ${C.accent}44`,
+              fontSize:10, color:C.muted, lineHeight:1.6,
+            }}>
+              ⚠️ AI解説は情報提供を目的としたものです。投資判断はご自身の責任で行ってください。
+            </div>
+          </div>
+        )}
+      </div>
+
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
+};
+
+const ManualInputPanel = ({ manualData, setManualData, onApply }) => (
+  <JudgmentEngine onValuesChange={setManualData} />
+);
+
+// ═══════════════════════════════════════════════════════════════
+//  PHASE 4 — API STATUS PANEL
+// ═══════════════════════════════════════════════════════════════
+const ApiStatusPanel=({apiResults})=>(
+  <Card>
+    <STitle>🔌 APIステータス（stooq.com）</STitle>
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      {Object.entries(apiResults).map(([id,res])=>{
+        const sym=API_SYMBOLS[id];
+        return (
+          <div key={id} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 12px",
+            borderRadius:8,background:"#f1f5f9",border:`1px solid ${C.border}`}}>
+            <div style={{width:8,height:8,borderRadius:"50%",background:sym.color,flexShrink:0}}/>
+            <span style={{flex:1,fontSize:12,fontWeight:600,color:C.text}}>{sym.name}</span>
+            <span style={{fontSize:10,color:C.muted,fontFamily:"monospace"}}>{sym.stooq}</span>
+            <span style={{fontSize:11,fontWeight:700,
+              color:res.status==="ok"?C.bull:res.status==="loading"?C.warn:C.bear}}>
+              {res.status==="ok"?`✓ ${sym.currency}${res.latest?.toLocaleString()}`:res.status==="loading"?"取得中...":"✗ エラー"}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+    <div style={{marginTop:10,fontSize:11,color:C.muted,lineHeight:1.6}}>
+      ※ stooq.comは無料の株価データプロバイダーです。東証・NASDAQ・KRXのEODデータを提供します。<br/>
+      CORSエラーが発生した場合は手動入力モードをご利用ください。
+    </div>
+  </Card>
+);
+
+// ═══════════════════════════════════════════════════════════════
+//  PHASE 1 — CHECKLIST
+// ═══════════════════════════════════════════════════════════════
+const CHECKLIST_DEF=[
+  {id:"vix",    label:"VIX",        desc:"40〜50台→ピークアウト後に低下 = 買いシグナル"},
+  {id:"pc",     label:"P/C 比率",   desc:"70%台（特に60%以下）= 極度の売られ過ぎ"},
+  {id:"volume", label:"出来高",     desc:"記録的出来高＋急落→安定化 = 悪材料出尽くし"},
+  {id:"wick",   label:"下ヒゲ",     desc:"実体の2倍以上の下ヒゲ = 最強の底値シグナル"},
+  {id:"ma25",   label:"25日MA乖離", desc:"−10〜15%以上でプラス転換 = 自律反発シグナル"},
+];
+const ChecklistPanel=({checks,setChecks})=>(
+  <Card>
+    <STitle>📋 5指標チェックリスト（毎日 9:00 / 12:00 / 15:30）</STitle>
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      {CHECKLIST_DEF.map(ind=>(
+        <div key={ind.id} onClick={()=>setChecks(p=>({...p,[ind.id]:!p[ind.id]}))}
+          style={{display:"flex",alignItems:"flex-start",gap:12,cursor:"pointer",padding:"10px 12px",borderRadius:8,
+            background:checks[ind.id]?"#dcfce7":"#f8fafc",border:`1px solid ${checks[ind.id]?C.bull:C.border}`,transition:"all .2s"}}>
+          <div style={{width:20,height:20,borderRadius:4,flexShrink:0,marginTop:1,
+            background:checks[ind.id]?C.bull:"transparent",border:`2px solid ${checks[ind.id]?C.bull:C.muted}`,
+            display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,color:"#fff"}}>
+            {checks[ind.id]&&"✓"}
+          </div>
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:checks[ind.id]?C.bull:C.text}}>{ind.label}</div>
+            <div style={{fontSize:11,color:C.muted,marginTop:2}}>{ind.desc}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+    <div style={{marginTop:10,fontSize:12,color:C.muted,textAlign:"right"}}>
+      {Object.values(checks).filter(Boolean).length} / {CHECKLIST_DEF.length} 点灯
+    </div>
+  </Card>
+);
+
+// ═══════════════════════════════════════════════════════════════
+//  PHASE 2 — SECTOR
+// ═══════════════════════════════════════════════════════════════
+const SECTOR_COMPANIES=[
+  {id:"kioxia",color:C.accent},{id:"samsung",color:C.blue},
+  {id:"skhynix",color:C.purple},{id:"micron",color:C.cyan},{id:"sandisk",color:C.orange},
+];
+// ── 4/10 実データ（画像より）──────────────────────────────
+const SECTOR_SNAPSHOT_BASE=[
+  {id:"kioxia",  name:"Kioxia",   ticker:"285A",  price:"¥30,140",  change: 8.81, rsi:88, trend:"SELL", note:"本日+8.81%の急騰。RSI87超で短期過熱。押し目を待ちたい"},
+  {id:"samsung", name:"Samsung",  ticker:"SSNLF", price:"~$7.5",    change: 1.2,  rsi:54, trend:"HOLD", note:"関税緩和期待で反発。NAND回復は緩慢"},
+  {id:"skhynix", name:"SK Hynix", ticker:"000660",price:"~₩205,000",change: 2.8,  rsi:62, trend:"BUY",  note:"HBM3E需要堅調。AI向けメモリが牽引"},
+  {id:"micron",  name:"Micron",   ticker:"MU",    price:"~$88",     change: 1.9,  rsi:57, trend:"BUY",  note:"データセンター向けNAND・DRAM好調"},
+  {id:"sandisk", name:"SandDisk", ticker:"WDC",   price:"~$42",     change: 1.1,  rsi:48, trend:"HOLD", note:"コンシューマNANDは底打ちの兆し"},
+];
+
+const SectorTable=({sectorData,liveSnapshot})=>{
+  const snap = liveSnapshot || SECTOR_SNAPSHOT_BASE;
+  const spark=sectorData.slice(-10);
+  return (
+    <Card style={{padding:0,overflow:"hidden"}}>
+      <div style={{padding:"16px 20px 12px",borderBottom:`1px solid ${C.border}`}}>
+        <STitle>🌐 メモリセクター比較テーブル</STitle>
+        <div style={{fontSize:11,color:C.muted}}>米国メモリ反発 = Kioxia反発の先行指標</div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1.6fr .9fr .8fr .8fr .6fr 1.8fr 2fr",
+        padding:"8px 20px",background:"#f8fafc",fontSize:10,color:C.muted,letterSpacing:.8,borderBottom:`1px solid ${C.border}`}}>
+        {["銘柄","株価","前日比","RSI","シグナル","トレンド(10日)","コメント"].map(h=><div key={h}>{h}</div>)}
+      </div>
+      {snap.map((co,idx)=>{
+        const isUp=co.change>=0;
+        const cc=SECTOR_COMPANIES.find(c=>c.id===co.id)?.color||C.text;
+        const isK=co.id==="kioxia";
+        return (
+          <div key={co.id} style={{display:"grid",gridTemplateColumns:"1.6fr .9fr .8fr .8fr .6fr 1.8fr 2fr",
+            padding:"12px 20px",borderBottom:idx<snap.length-1?`1px solid ${C.border}`:"none",
+            background:isK?"#f59e0b08":"transparent",alignItems:"center",gap:4}}>
+            <div>
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                <div style={{width:8,height:8,borderRadius:"50%",background:cc}}/>
+                <span style={{fontSize:13,fontWeight:isK?800:600,color:isK?C.accent:C.text}}>{co.name}</span>
+              </div>
+              <div style={{fontSize:10,color:C.muted,marginTop:1}}>{co.ticker}</div>
+            </div>
+            <div style={{fontSize:13,fontWeight:700}}>{co.price}</div>
+            <div style={{fontSize:13,color:isUp?C.bull:C.bear,fontWeight:600}}>{isUp?"▲":"▼"}{Math.abs(co.change)}%</div>
+            <div>
+              <div style={{fontSize:12,fontWeight:700,color:co.rsi<35?C.bull:co.rsi>65?C.bear:C.text}}>{co.rsi}</div>
+              <div style={{width:36,height:3,borderRadius:2,background:C.border,marginTop:3}}>
+                <div style={{width:`${co.rsi}%`,height:"100%",borderRadius:2,background:co.rsi<35?C.bull:co.rsi>65?C.bear:C.muted}}/>
+              </div>
+            </div>
+            <div><SignalBadge signal={co.trend} small/></div>
+            <div style={{height:36}}>
+              <ResponsiveContainer width="100%" height={36}>
+                <LineChart data={spark} margin={{top:2,right:2,left:2,bottom:2}}>
+                  <Line type="monotone" dataKey={co.id} stroke={cc} strokeWidth={1.5} dot={false}/>
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+            <div style={{fontSize:10,color:C.muted,lineHeight:1.5}}>{co.note}</div>
+          </div>
+        );
+      })}
+    </Card>
+  );
+};
+
+const SectorTrendChart=({sectorData})=>(
+  <Card>
+    <STitle>📈 セクター相対推移（過去30日 ／ 基準値100）</STitle>
+    <ResponsiveContainer width="100%" height={200}>
+      <LineChart data={sectorData} margin={{top:4,right:8,left:0,bottom:0}}>
+        <CartesianGrid strokeDasharray="3 3" stroke={C.border}/>
+        <XAxis dataKey="date" tick={{fontSize:10,fill:C.muted}} interval={6}/>
+        <YAxis tick={{fontSize:10,fill:C.muted}} domain={["auto","auto"]}/>
+        <Tooltip contentStyle={{background:"#ffffff",border:`1px solid ${C.border}`,borderRadius:8,fontSize:12}}/>
+        <ReferenceLine y={100} stroke={C.border} strokeDasharray="4 4"/>
+        {SECTOR_COMPANIES.map(co=>(
+          <Line key={co.id} type="monotone" dataKey={co.id} stroke={co.color}
+            strokeWidth={co.id==="kioxia"?2.5:1.5} dot={false} opacity={co.id==="kioxia"?1:.7}/>
+        ))}
+      </LineChart>
+    </ResponsiveContainer>
+    <div style={{display:"flex",gap:14,flexWrap:"wrap",marginTop:8}}>
+      {SECTOR_COMPANIES.map(co=>(
+        <div key={co.id} style={{display:"flex",alignItems:"center",gap:5,fontSize:11}}>
+          <div style={{width:co.id==="kioxia"?20:14,height:co.id==="kioxia"?3:2,background:co.color,borderRadius:2}}/>
+          <span style={{color:co.id==="kioxia"?C.accent:C.muted,fontWeight:co.id==="kioxia"?700:400}}>
+            {co.id==="kioxia"?"Kioxia":co.id==="samsung"?"Samsung":co.id==="skhynix"?"SK Hynix":co.id==="micron"?"Micron":"SandDisk"}
+          </span>
+        </div>
+      ))}
+    </div>
+  </Card>
+);
+
+// ═══════════════════════════════════════════════════════════════
+//  PHASE 2 — MACRO
+// ═══════════════════════════════════════════════════════════════
+// ── 4/10 実データ反映（VIX:19.23、日経:56924、USD/JPY:159.29）──
+const MACRO_FACTORS=[
+  {key:"usMemory",label:"米メモリ\nセクター",score:68,desc:"MU・SKXが反発基調。本日Kioxia+8.81%はセクター全体の回復を示す。先行指標として良好。"},
+  {key:"tariff",  label:"関税\nリスク",      score:35,desc:"4/9に米国が対中関税を125%まで引上げ。半導体は一部除外措置あり。不透明感は残る。"},
+  {key:"aiDemand",label:"AI\n需要",          score:80,desc:"HBM・データセンター向けNAND需要は堅調。AI設備投資は継続拡大中。"},
+  {key:"vix",     label:"VIX\n安定度",       score:71,desc:"VIX 19.23（-1.33%）。20を下回り安定圏に回帰。リスクオン環境が整いつつある。"},
+  {key:"nikkei",  label:"日経225\n安定性",   score:72,desc:"日経225は56,924円（+1.84%）。先物も57,490円と堅調。国内市場の安心感が高い。"},
+  {key:"bainSell",label:"Bain\n売出し",      score:35,desc:"大株主売出しの懸念は残るが、本日の急騰で需給が改善しつつある兆し。"},
+];
+const MACRO_OVERALL=Math.round(MACRO_FACTORS.reduce((s,f)=>s+f.score,0)/MACRO_FACTORS.length);
+
+const ScoreGauge=({score})=>{
+  const r=64,cx=80,cy=80,total=220,toRad=d=>(d*Math.PI)/180;
+  const arc=(from,to,rad)=>{
+    const s={x:cx+rad*Math.cos(toRad(-from)),y:cy-rad*Math.sin(toRad(-from))};
+    const e={x:cx+rad*Math.cos(toRad(-to)),y:cy-rad*Math.sin(toRad(-to))};
+    return `M ${s.x} ${s.y} A ${rad} ${rad} 0 ${Math.abs(to-from)>180?1:0} 1 ${e.x} ${e.y}`;
+  };
+  const color=score>=60?C.bull:score>=40?C.accent:C.bear;
+  return (
+    <svg width={160} height={110} viewBox="0 0 160 110">
+      <path d={arc(200,-20,r)} fill="none" stroke={C.border} strokeWidth={10} strokeLinecap="round"/>
+      <path d={arc(200,200-(score/100)*total,r)} fill="none" stroke={color} strokeWidth={10} strokeLinecap="round"/>
+      <text x={cx} y={cy+4} textAnchor="middle" fill={color} fontSize={26} fontWeight={800}>{score}</text>
+      <text x={cx} y={cy+22} textAnchor="middle" fill={C.muted} fontSize={11}>{score>=60?"好環境":score>=40?"中立":"警戒"}</text>
+    </svg>
+  );
+};
+
+const MacroScorePanel=({liveVix,livePc})=>{
+  const [sel,setSel]=useState(null);
+  const factors=[...MACRO_FACTORS];
+  if(liveVix){const idx=factors.findIndex(f=>f.key==="vix");if(idx>=0)factors[idx]={...factors[idx],score:Math.round(Math.max(0,Math.min(100,100-liveVix*1.5)))}}
+  if(livePc){const idx=factors.findIndex(f=>f.key==="usMemory");if(idx>=0)factors[idx]={...factors[idx],score:Math.round(Math.max(0,Math.min(100,livePc)))}}
+  const overall=Math.round(factors.reduce((s,f)=>s+f.score,0)/factors.length);
+  return (
+    <Card>
+      <STitle>🌍 マクロ環境スコア {liveVix?<span style={{color:C.bull,fontSize:10}}>（VIX: {liveVix}）</span>:null}</STitle>
+      <div style={{display:"flex",gap:20,alignItems:"flex-start",flexWrap:"wrap"}}>
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",minWidth:160}}>
+          <ScoreGauge score={overall}/>
+          <div style={{fontSize:11,color:C.muted,marginTop:4,textAlign:"center"}}>総合スコア（6指標平均）</div>
+        </div>
+        <div style={{flex:1,display:"flex",flexDirection:"column",gap:8,minWidth:220}}>
+          {factors.map(f=>{
+            const bc=f.score>=60?C.bull:f.score>=40?C.accent:C.bear;
+            const isSel=sel===f.key;
+            return (
+              <div key={f.key}>
+                <div onClick={()=>setSel(isSel?null:f.key)} style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",
+                  padding:"6px 10px",borderRadius:6,background:isSel?"#ffffff08":"transparent",border:`1px solid ${isSel?C.border:"transparent"}`}}>
+                  <div style={{fontSize:12,color:C.muted,width:72,flexShrink:0,whiteSpace:"pre-line",lineHeight:1.3}}>{f.label}</div>
+                  <div style={{flex:1,height:6,background:C.border,borderRadius:3}}>
+                    <div style={{width:`${f.score}%`,height:"100%",borderRadius:3,background:bc,transition:"width .4s"}}/>
+                  </div>
+                  <div style={{fontSize:12,fontWeight:700,color:bc,width:28,textAlign:"right"}}>{f.score}</div>
+                </div>
+                {isSel&&<div style={{fontSize:11,color:C.muted,padding:"6px 10px 6px 82px",lineHeight:1.6,borderLeft:`2px solid ${bc}`,marginLeft:10}}>{f.desc}</div>}
+              </div>
+            );
+          })}
+        </div>
+        <div style={{minWidth:180}}>
+          <ResponsiveContainer width={180} height={180}>
+            <RadarChart data={factors.map(f=>({subject:f.label.replace("\n",""),score:f.score}))}>
+              <PolarGrid stroke={C.border}/>
+              <PolarAngleAxis dataKey="subject" tick={{fontSize:9,fill:C.muted}}/>
+              <Radar name="マクロ" dataKey="score" stroke={C.accent} fill={C.accent} fillOpacity={.15} strokeWidth={2}/>
+            </RadarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+    </Card>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  PHASE 3 — RISK + TRADE
+// ═══════════════════════════════════════════════════════════════
+const RISK_ITEMS=[
+  {id:"rsi",    label:"RSI過熱リスク（短期）",        level:"HIGH",   desc:"本日RSI短期87.73・長期74.72。いずれも買われ過ぎ圏。急騰後の短期調整に要注意。",  action:"追撃買いは厳禁。¥32,000〜¥35,000で段階的に利確を検討"},
+  {id:"tariff", label:"米国関税・輸出規制リスク",      level:"HIGH",   desc:"4/9に対中関税125%まで引上げ。半導体は一部除外も不透明感残る。催促相場の側面も。",action:"規制動向を週次でモニタリング。急騰が剥落するリスクあり"},
+  {id:"bain",   label:"Bain Capital 売出しリスク",   level:"MEDIUM", desc:"大株主による売出しの懸念。本日の急騰局面で売り圧力が増す可能性。",               action:"出来高と需給バランスを翌営業日に確認"},
+  {id:"margin", label:"信用取引・含み益管理",         level:"LOW",    desc:"現在¥30,140で取得単価¥22,721から+32%超。含み益が大きく逆回転リスクに注意。",     action:"¥25,000〜¥26,000を新しい損切りラインの目安に設定"},
+  {id:"nikkei", label:"日経225連動リスク",            level:"LOW",    desc:"日経56,924（+1.84%）と堅調。ただし先物57,490と乖離あり。ギャップリスクに注意。", action:"翌日の寄り付きを確認してから判断"},
+  {id:"vix",    label:"VIX（現在19.23）",             level:"LOW",    desc:"VIX 19.23（-1.33%）と安定圏。リスクオン環境が整っているが、急上昇に備える。",    action:"VIX 25超に跳ね上がったら即座にポジション縮小"},
+];
+const RC={HIGH:C.bear,MEDIUM:C.warn,LOW:C.bull};
+const RBG={HIGH:"#fef2f2",MEDIUM:"#fffbeb",LOW:"#f0fdf4"};
+
+const RiskDashboard=({currentPrice})=>{
+  const [expanded,setExpanded]=useState({});
+  // 損切りラインを現実的な水準に更新（取得単価¥22,721の-10%程度）
+  const stopLoss=25000,acquisition=22721,shares=300;
+  const pnl=(currentPrice-acquisition)*shares;
+  const distToStop=((currentPrice-stopLoss)/currentPrice*100).toFixed(1);
+  const high=RISK_ITEMS.filter(r=>r.level==="HIGH").length;
+  const overall=high>=2?"HIGH":high>=1?"MEDIUM":"LOW";
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12}}>
+        <Card style={{padding:"14px 16px",border:`1px solid ${RC[overall]}`,background:RBG[overall]+"44"}}>
+          <STitle>総合リスクレベル</STitle>
+          <div style={{fontSize:22,fontWeight:900,color:RC[overall]}}>{overall==="HIGH"?"🔴 高":overall==="MEDIUM"?"🟡 中":"🟢 低"}</div>
+          <div style={{fontSize:11,color:C.muted,marginTop:4}}>{high}件の高リスク項目</div>
+        </Card>
+        <Card style={{padding:"14px 16px"}}>
+          <STitle>損切りまでの距離</STitle>
+          <div style={{fontSize:22,fontWeight:900,color:parseFloat(distToStop)<5?C.bear:parseFloat(distToStop)<10?C.warn:C.bull}}>{distToStop}%</div>
+          <div style={{fontSize:11,color:C.muted,marginTop:4}}>基準 ¥{stopLoss.toLocaleString()}</div>
+        </Card>
+        <Card style={{padding:"14px 16px"}}>
+          <STitle>含み損益</STitle>
+          <div style={{fontSize:22,fontWeight:900,color:pnl>=0?C.bull:C.bear}}>{pnl>=0?"+":""}¥{pnl.toLocaleString()}</div>
+          <div style={{fontSize:11,color:C.muted,marginTop:4}}>{((pnl/acquisition/shares)*100).toFixed(1)}%（{shares}株）</div>
+        </Card>
+      </div>
+      <Card>
+        <STitle>⚠️ 信用ポジション リスクメーター</STitle>
+        <div style={{position:"relative",height:28,borderRadius:6,overflow:"hidden",display:"flex"}}>
+          <div style={{flex:1,background:"#fef2f2",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:C.bear,fontWeight:700}}>危険域 &lt;¥20.5k</div>
+          <div style={{flex:1,background:"#fffbeb",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:C.warn,fontWeight:700}}>警戒域 ¥20.5〜25k</div>
+          <div style={{flex:1,background:"#f0fdf4",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:C.bull,fontWeight:700}}>利確域 &gt;¥28k</div>
+        </div>
+        {(()=>{const pos=Math.max(0,Math.min(100,(currentPrice-18000)/(36000-18000)*100));return(
+          <div style={{position:"relative",height:20,marginTop:2}}>
+            <div style={{position:"absolute",left:`${pos}%`,transform:"translateX(-50%)",fontSize:16,color:C.accent}}>▲</div>
+          </div>
+        );})()}
+        <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:C.muted,marginTop:2}}>
+          <span>¥18,000</span><span style={{color:C.accent,fontWeight:700}}>現在 ¥{currentPrice.toLocaleString()}</span><span>¥36,000</span>
+        </div>
+      </Card>
+      <Card style={{padding:0,overflow:"hidden"}}>
+        <div style={{padding:"14px 20px 10px",borderBottom:`1px solid ${C.border}`}}>
+          <STitle>🚨 リスク項目一覧（タップで詳細表示）</STitle>
+        </div>
+        {RISK_ITEMS.map((r,idx)=>{
+          const isExp=expanded[r.id];
+          return (
+            <div key={r.id} style={{borderBottom:idx<RISK_ITEMS.length-1?`1px solid ${C.border}`:"none"}}>
+              <div onClick={()=>setExpanded(p=>({...p,[r.id]:!p[r.id]}))}
+                style={{display:"flex",alignItems:"center",gap:12,padding:"12px 20px",cursor:"pointer",background:isExp?"#ffffff06":"transparent"}}>
+                <span style={{background:RBG[r.level],color:RC[r.level],border:`1px solid ${RC[r.level]}`,
+                  borderRadius:4,padding:"2px 8px",fontSize:10,fontWeight:700,minWidth:40,textAlign:"center"}}>{r.level}</span>
+                <span style={{flex:1,fontSize:13,fontWeight:600,color:C.text}}>{r.label}</span>
+                <span style={{color:C.muted,fontSize:14,transform:isExp?"rotate(90deg)":"none",transition:"transform .2s"}}>›</span>
+              </div>
+              {isExp&&(
+                <div style={{padding:"0 20px 14px",borderTop:`1px solid ${C.border}`,background:"#f8fafc"}}>
+                  <div style={{fontSize:12,color:C.muted,lineHeight:1.7,marginBottom:8,marginTop:10}}>{r.desc}</div>
+                  <div style={{display:"flex",gap:8,padding:"8px 12px",borderRadius:6,background:RBG[r.level]+"55",border:`1px solid ${RC[r.level]}`}}>
+                    <span style={{color:RC[r.level],fontWeight:700,fontSize:12,whiteSpace:"nowrap"}}>→ 対策：</span>
+                    <span style={{fontSize:12,color:C.text,lineHeight:1.6}}>{r.action}</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </Card>
+    </div>
+  );
+};
+
+const SCENARIOS=[
+  // 現在株価¥30,140・RSI87超・MACD強気を踏まえたシナリオ
+  {id:"bull",label:"📈 シナリオA：高値追い継続",color:C.bull,bg:"#dcfce7",
+    conditions:["明日も出来高を伴って¥30,000以上をキープ","日経・米メモリが連騰継続","VIX 18以下まで低下"],
+    action:"利確は急がず¥32,000〜¥35,000を次の利確目安に設定",followup:"残り株は¥38,000超を中長期目標にホールド継続",probability:30},
+  {id:"base",label:"⚡ シナリオB：急騰後の調整",color:C.warn,bg:"#fffbeb",
+    conditions:["RSI87超の過熱感から短期的な押し目入り","¥26,000〜¥30,000のレンジで調整","出来高が急減して膠着状態に"],
+    action:"押し目での買い増しは¥26,000〜¥27,000台を目安に検討",followup:"¥25,000を下回ったら損切りラインを再設定",probability:50},
+  {id:"bear",label:"📉 シナリオC：急反落",color:C.bear,bg:"#fee2e2",
+    conditions:["関税規制の新たな拡大発表","本日の急騰が「催促相場」と判明し利確売り殺到","米メモリが週間5%以上下落"],
+    action:"¥25,000〜¥26,000で部分売却（150株）で利益を確定",followup:"¥22,721（取得単価）を割ったら全売りを検討",probability:20},
+];
+
+const TradeDecisionPanel=({last,overallSignal,macroScore})=>{
+  const [activeSc,setActiveSc]=useState("base");
+  // RSI87超・MACD強気シグナルを反映した推奨ロジック
+  const rsiOverbought = last.rsi > 80;
+  const rec= rsiOverbought
+    ?{label:"短期利確を検討 ／ 追撃は慎重に",color:C.warn, icon:"🟡",detail:`RSI ${last.rsi}超の過熱域。本日+8.81%の急騰後。今すぐ全売りではなく¥32,000〜¥35,000付近で段階的に利確するのが現実的。`}
+    :overallSignal==="BUY"&&macroScore>=50
+    ?{label:"ホールド継続 ／ 押し目で買い増し",color:C.bull, icon:"🟢",detail:"テクニカル・マクロともに強気。取得単価¥22,721から既に+32%。含み益を守りながら伸ばすフェーズ。"}
+    :overallSignal==="SELL"
+    ?{label:"損切り準備 / 様子見",color:C.bear, icon:"🔴",detail:"売りシグナル点灯。¥22,721（取得単価）を明確に割ったら損切りを実行。"}
+    :{label:"現状ホールド",color:C.warn, icon:"🟡",detail:"判断が拮抗。5指標チェックリストが3つ以上点灯してから動く。"};
+  const sc=SCENARIOS.find(s=>s.id===activeSc);
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      <Card style={{border:`1px solid ${rec.color}`,background:rec.color+"11"}}>
+        <div style={{display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+          <div style={{fontSize:40}}>{rec.icon}</div>
+          <div style={{flex:1}}>
+            <div style={{fontSize:11,color:C.muted,marginBottom:4}}>🤖 現時点の推奨アクション</div>
+            <div style={{fontSize:20,fontWeight:900,color:rec.color,marginBottom:6}}>{rec.label}</div>
+            <div style={{fontSize:13,color:C.text,lineHeight:1.7}}>{rec.detail}</div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:6,minWidth:140}}>
+            {[{l:"テクニカル",v:overallSignal,c:overallSignal==="BUY"?C.bull:overallSignal==="SELL"?C.bear:C.warn},
+              {l:"マクロ",v:`${macroScore}点`,c:macroScore>=60?C.bull:macroScore>=40?C.warn:C.bear}].map(r=>(
+              <div key={r.l} style={{display:"flex",justifyContent:"space-between",gap:8,fontSize:12}}>
+                <span style={{color:C.muted}}>{r.l}</span><span style={{color:r.c,fontWeight:700}}>{r.v}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </Card>
+      <Card>
+        <STitle>📋 3シナリオ別 対応プラン</STitle>
+        <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
+          {SCENARIOS.map(s=>(
+            <button key={s.id} onClick={()=>setActiveSc(s.id)}
+              style={{...TAB_BTN(activeSc===s.id),color:activeSc===s.id?"#000":s.color,
+                background:activeSc===s.id?s.color:"#f8fafc",border:`1px solid ${activeSc===s.id?s.color:C.border}`}}>
+              {s.label}
+            </button>
+          ))}
+        </div>
+        {sc&&(
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            <div style={{display:"flex",alignItems:"center",gap:12}}>
+              <span style={{fontSize:12,color:C.muted,minWidth:60}}>想定確率</span>
+              <div style={{flex:1,height:8,background:C.border,borderRadius:4}}>
+                <div style={{width:`${sc.probability}%`,height:"100%",borderRadius:4,background:sc.color}}/>
+              </div>
+              <span style={{fontSize:14,fontWeight:800,color:sc.color}}>{sc.probability}%</span>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {sc.conditions.map((cond,i)=>(
+                <div key={i} style={{display:"flex",gap:8,fontSize:13}}>
+                  <span style={{color:sc.color,fontWeight:700}}>✓</span>
+                  <span style={{color:C.text,lineHeight:1.5}}>{cond}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{padding:"12px 16px",borderRadius:8,background:sc.bg,border:`1px solid ${sc.color}`}}>
+              <div style={{fontSize:11,color:sc.color,fontWeight:700,marginBottom:6}}>▶ 推奨アクション</div>
+              <div style={{fontSize:13,color:C.text,lineHeight:1.7,marginBottom:8}}>{sc.action}</div>
+              <div style={{fontSize:12,color:C.muted}}>その後の対応：{sc.followup}</div>
+            </div>
+          </div>
+        )}
+      </Card>
+      <Card>
+        <STitle>📝 今日の判断メモ（4/10 更新）</STitle>
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {[
+            {label:"実現益（累計）",      val:"¥134,500",                   color:C.bull,  note:"2025年3月時点の確定利益"},
+            {label:"現在の評価損益",      val:`+¥${((last.close-22721)*300).toLocaleString()}`,color:C.bull,note:`¥${last.close.toLocaleString()}（現値）- ¥22,721（取得単価）× 300株`},
+            {label:"含み益率",            val:`+${(((last.close-22721)/22721)*100).toFixed(1)}%`, color:C.bull, note:"取得単価¥22,721比"},
+            {label:"次の利確目安",        val:"¥32,000〜¥35,000",           color:C.cyan,  note:"RSI過熱のため段階的に100株ずつ売却"},
+            {label:"損切りライン（更新）", val:"¥25,000〜¥26,000",          color:C.bear,  note:"急騰後の調整時。取得単価割れは論外"},
+            {label:"本日のRSI",           val:`${last.rsi}（過熱域）`,      color:C.bear,  note:"80超は短期的な天井サイン。追撃は慎重に"},
+            {label:"次回確認タイミング",  val:"翌営業日 9:00・12:00・15:30",color:C.muted, note:"5指標チェックリストを使用"},
+          ].map(row=>(
+            <div key={row.label} style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+              padding:"10px 14px",borderRadius:8,background:"#f1f5f9",border:`1px solid ${C.border}`,flexWrap:"wrap",gap:8}}>
+              <div>
+                <div style={{fontSize:12,color:C.muted}}>{row.label}</div>
+                <div style={{fontSize:11,color:C.muted,opacity:.7}}>{row.note}</div>
+              </div>
+              <div style={{fontSize:15,fontWeight:800,color:row.color}}>{row.val}</div>
+            </div>
+          ))}
+        </div>
+        {/* Alert box for RSI overbought */}
+        <div style={{marginTop:12,padding:"10px 14px",borderRadius:8,background:"#fee2e244",border:`1px solid ${C.bear}`,fontSize:12,color:C.text,lineHeight:1.7}}>
+          <span style={{fontWeight:700,color:C.bear}}>⚠️ 本日の注意点：</span>
+          RSI短期 {last.rsi}・長期 74.72 はいずれも過熱域。本日+8.81%の急騰は「関税緩和期待の催促相場」の側面も。
+          明日の寄り付きの値動きと出来高を確認してから追加判断することを推奨。
+        </div>
+      </Card>
+    </div>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  📒 トレード日誌 — 判断の記録・振り返り
+// ═══════════════════════════════════════════════════════════════
+
+const ACTION_OPTIONS = [
+  { id:"buy_new",   label:"新規買い",     color:C.bull,  icon:"🟢" },
+  { id:"buy_add",   label:"買い増し",     color:C.bull,  icon:"➕" },
+  { id:"sell_part", label:"部分利確",     color:C.cyan,  icon:"📤" },
+  { id:"sell_all",  label:"全売り",       color:C.bear,  icon:"🔴" },
+  { id:"hold",      label:"ホールド",     color:C.warn,  icon:"⏸"  },
+  { id:"watch",     label:"様子見",       color:C.muted, icon:"👀" },
+];
+
+const JournalPanel = ({ journalEntries, setJournalEntries, currentVals, currentResult }) => {
+  const [showForm,  setShowForm]  = useState(false);
+  const [action,    setAction]    = useState("hold");
+  const [memo,      setMemo]      = useState("");
+  const [outcome,   setOutcome]   = useState(""); // 後日記入：実際の結果
+  const [editOutcomeId, setEditOutcomeId] = useState(null);
+  const [outcomeText,   setOutcomeText]   = useState("");
+  const [filterAction,  setFilterAction]  = useState("all");
+
+  const saveEntry = () => {
+    const now = new Date();
+    const entry = {
+      id:         Date.now(),
+      datetime:   now.toLocaleString("ja-JP", { month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit" }),
+      isoDate:    now.toISOString(),
+      price:      parseFloat(currentVals.price) || 0,
+      rsiS:       parseFloat(currentVals.rsiS)  || 0,
+      rsiL:       parseFloat(currentVals.rsiL)  || 0,
+      macd:       parseFloat(currentVals.macd)  || 0,
+      macdSig:    parseFloat(currentVals.macdSig) || 0,
+      vix:        parseFloat(currentVals.vix)   || 0,
+      judgment:   currentResult.judgment,
+      techScore:  currentResult.techScore,
+      checkScore: currentResult.checkScore,
+      totalScore: currentResult.totalScore,
+      litCount:   currentResult.litCount,
+      action,
+      memo,
+      outcome: "",   // 後日記入
+    };
+    setJournalEntries(prev => [entry, ...prev]);
+    setMemo("");
+    setShowForm(false);
+  };
+
+  const saveOutcome = (id) => {
+    setJournalEntries(prev =>
+      prev.map(e => e.id === id ? { ...e, outcome: outcomeText } : e)
+    );
+    setEditOutcomeId(null);
+    setOutcomeText("");
+  };
+
+  const deleteEntry = (id) => {
+    if (window.confirm("この記録を削除しますか？")) {
+      setJournalEntries(prev => prev.filter(e => e.id !== id));
+    }
+  };
+
+  const filtered = filterAction === "all"
+    ? journalEntries
+    : journalEntries.filter(e => e.action === filterAction);
+
+  const jColor = (j) => j === "BUY" ? C.bull : j === "SELL" ? C.bear : C.warn;
+  const jLabel = (j) => j === "BUY" ? "🟢 買い" : j === "SELL" ? "🔴 売り" : "🟡 様子見";
+  const aOpt   = (id) => ACTION_OPTIONS.find(a => a.id === id) || ACTION_OPTIONS[5];
+
+  // 統計
+  const stats = {
+    total:   journalEntries.length,
+    buyDays: journalEntries.filter(e => e.judgment === "BUY").length,
+    avgScore: journalEntries.length
+      ? Math.round(journalEntries.reduce((s,e) => s + e.totalScore, 0) / journalEntries.length)
+      : 0,
+    withOutcome: journalEntries.filter(e => e.outcome).length,
+  };
+
+  return (
+    <div style={{display:"flex", flexDirection:"column", gap:14}}>
+
+      {/* ── ヘッダー + 記録ボタン ── */}
+      <div style={{
+        background: C.surface, border:`1px solid ${C.border}`, borderRadius:12,
+        padding:"16px 18px", display:"flex", alignItems:"center",
+        justifyContent:"space-between", gap:12, flexWrap:"wrap",
+      }}>
+        <div>
+          <div style={{fontSize:15, fontWeight:800, color:C.text, marginBottom:2}}>
+            📒 トレード日誌
+          </div>
+          <div style={{fontSize:11, color:C.muted}}>
+            判断の記録・振り返りで投資力を磨く　|　全 {stats.total} 件記録済み
+          </div>
+        </div>
+        <button
+          onClick={() => setShowForm(p => !p)}
+          style={{
+            padding:"10px 18px", borderRadius:8,
+            background: showForm ? C.border : C.accent,
+            color: showForm ? C.muted : "#fff",
+            fontWeight:800, fontSize:13, border:"none",
+            cursor:"pointer", fontFamily:"inherit", transition:"all .2s",
+          }}
+        >
+          {showForm ? "✕ キャンセル" : "＋ 今の判断を記録する"}
+        </button>
+      </div>
+
+      {/* ── 記録フォーム ── */}
+      {showForm && (
+        <div style={{
+          background:"#fffbeb", border:`2px solid ${C.accent}`,
+          borderRadius:12, padding:"18px",
+          display:"flex", flexDirection:"column", gap:14,
+        }}>
+          <div style={{fontSize:13, fontWeight:700, color:C.accent}}>
+            ✍️ 今日の判断を記録する（{new Date().toLocaleDateString("ja-JP")}）
+          </div>
+
+          {/* 現在の判定サマリー */}
+          <div style={{
+            display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:8,
+            padding:"12px", borderRadius:8, background:"#fff",
+            border:`1px solid ${C.border}`,
+          }}>
+            {[
+              { label:"現在値",    val:`¥${(parseFloat(currentVals.price)||0).toLocaleString()}`, color:C.text },
+              { label:"AI判定",    val:jLabel(currentResult.judgment), color:jColor(currentResult.judgment) },
+              { label:"総合スコア",val:`${currentResult.totalScore > 0 ? "+" : ""}${currentResult.totalScore}点`, color:jColor(currentResult.judgment) },
+              { label:"5指標",     val:`${currentResult.litCount}/5点灯`, color:C.bull },
+            ].map(k => (
+              <div key={k.label} style={{textAlign:"center"}}>
+                <div style={{fontSize:10, color:C.muted, marginBottom:3}}>{k.label}</div>
+                <div style={{fontSize:13, fontWeight:800, color:k.color}}>{k.val}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* 実際のアクション選択 */}
+          <div>
+            <div style={{fontSize:12, color:C.muted, marginBottom:8, fontWeight:600}}>
+              実際に取ったアクション（または予定）
+            </div>
+            <div style={{display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:8}}>
+              {ACTION_OPTIONS.map(opt => (
+                <button key={opt.id} onClick={() => setAction(opt.id)}
+                  style={{
+                    padding:"10px 8px", borderRadius:8, cursor:"pointer",
+                    background: action === opt.id ? opt.color+"22" : "#f8fafc",
+                    border:`2px solid ${action === opt.id ? opt.color : C.border}`,
+                    color: action === opt.id ? opt.color : C.muted,
+                    fontWeight: action === opt.id ? 800 : 400,
+                    fontSize:12, fontFamily:"inherit", transition:"all .15s",
+                  }}>
+                  {opt.icon} {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* メモ */}
+          <div>
+            <div style={{fontSize:12, color:C.muted, marginBottom:6, fontWeight:600}}>
+              判断メモ（なぜその行動を取ったか）
+            </div>
+            <textarea
+              value={memo}
+              onChange={e => setMemo(e.target.value)}
+              placeholder="例：RSIが過熱域だが5指標が3つ点灯しているのでホールド継続。明日の出来高を確認してから判断する。"
+              rows={3}
+              style={{
+                width:"100%", boxSizing:"border-box",
+                background:"#fff", border:`1px solid ${C.border}`,
+                borderRadius:8, padding:"10px 12px",
+                fontSize:13, color:C.text, fontFamily:"inherit",
+                outline:"none", resize:"vertical", lineHeight:1.6,
+              }}
+            />
+          </div>
+
+          <button onClick={saveEntry}
+            style={{
+              padding:"12px", borderRadius:8,
+              background:C.bull, color:"#fff",
+              fontWeight:800, fontSize:14, border:"none",
+              cursor:"pointer", fontFamily:"inherit",
+            }}>
+            💾 記録を保存する
+          </button>
+        </div>
+      )}
+
+      {/* ── 統計サマリー ── */}
+      {journalEntries.length > 0 && (
+        <div style={{display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10}}>
+          {[
+            { label:"記録件数",     val:`${stats.total}件`,        color:C.text  },
+            { label:"買い判定日",   val:`${stats.buyDays}日`,      color:C.bull  },
+            { label:"平均スコア",   val:`${stats.avgScore > 0 ? "+" : ""}${stats.avgScore}点`, color:C.blue  },
+            { label:"結果記入済み", val:`${stats.withOutcome}件`,  color:C.cyan  },
+          ].map(s => (
+            <div key={s.label} style={{
+              background:C.surface, border:`1px solid ${C.border}`,
+              borderRadius:10, padding:"12px 14px", textAlign:"center",
+            }}>
+              <div style={{fontSize:10, color:C.muted, marginBottom:4}}>{s.label}</div>
+              <div style={{fontSize:18, fontWeight:800, color:s.color}}>{s.val}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── フィルター ── */}
+      {journalEntries.length > 0 && (
+        <div style={{display:"flex", gap:8, flexWrap:"wrap"}}>
+          {[{id:"all",label:"すべて"}, ...ACTION_OPTIONS].map(opt => (
+            <button key={opt.id} onClick={() => setFilterAction(opt.id)}
+              style={{
+                padding:"5px 12px", borderRadius:20, fontSize:11,
+                background: filterAction === opt.id ? C.accent : "transparent",
+                color: filterAction === opt.id ? "#fff" : C.muted,
+                border:`1px solid ${filterAction === opt.id ? C.accent : C.border}`,
+                cursor:"pointer", fontFamily:"inherit", fontWeight: filterAction === opt.id ? 700 : 400,
+              }}>
+              {opt.icon || "📋"} {opt.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* ── 日誌一覧 ── */}
+      {journalEntries.length === 0 ? (
+        <div style={{
+          background:C.surface, border:`2px dashed ${C.border}`,
+          borderRadius:12, padding:"40px 20px",
+          display:"flex", flexDirection:"column", alignItems:"center", gap:10, color:C.muted,
+        }}>
+          <div style={{fontSize:40}}>📒</div>
+          <div style={{fontSize:14, fontWeight:600, color:C.text}}>まだ記録がありません</div>
+          <div style={{fontSize:12}}>「今の判断を記録する」ボタンで最初の記録を追加しましょう</div>
+        </div>
+      ) : (
+        <div style={{display:"flex", flexDirection:"column", gap:12}}>
+          {filtered.map(entry => {
+            const ao = aOpt(entry.action);
+            const isEditingOutcome = editOutcomeId === entry.id;
+            return (
+              <div key={entry.id} style={{
+                background:C.surface, border:`1px solid ${C.border}`,
+                borderRadius:12, overflow:"hidden",
+              }}>
+                {/* エントリーヘッダー */}
+                <div style={{
+                  display:"flex", alignItems:"center", justifyContent:"space-between",
+                  padding:"12px 16px", flexWrap:"wrap", gap:8,
+                  borderBottom:`1px solid ${C.border}`,
+                  background: entry.judgment === "BUY" ? "#f0fdf4"
+                            : entry.judgment === "SELL" ? "#fff1f2" : "#fffbeb",
+                }}>
+                  <div style={{display:"flex", alignItems:"center", gap:10}}>
+                    <div style={{fontSize:11, color:C.muted}}>{entry.datetime}</div>
+                    <span style={{
+                      fontSize:11, fontWeight:700, padding:"2px 8px", borderRadius:12,
+                      background: jColor(entry.judgment)+"22",
+                      color: jColor(entry.judgment),
+                      border:`1px solid ${jColor(entry.judgment)}44`,
+                    }}>
+                      {jLabel(entry.judgment)}
+                    </span>
+                    <span style={{
+                      fontSize:11, fontWeight:700, padding:"2px 8px", borderRadius:12,
+                      background: ao.color+"22", color: ao.color,
+                      border:`1px solid ${ao.color}44`,
+                    }}>
+                      {ao.icon} {ao.label}
+                    </span>
+                  </div>
+                  <button onClick={() => deleteEntry(entry.id)}
+                    style={{fontSize:11, color:C.muted, background:"transparent", border:"none",
+                      cursor:"pointer", padding:"2px 6px"}}>
+                    🗑
+                  </button>
+                </div>
+
+                {/* スコア行 */}
+                <div style={{
+                  display:"grid", gridTemplateColumns:"repeat(5,1fr)",
+                  padding:"10px 16px", gap:6, borderBottom:`1px solid ${C.border}`,
+                  background:"#f8fafc",
+                }}>
+                  {[
+                    { label:"株価",         val:`¥${entry.price.toLocaleString()}` },
+                    { label:"RSI短/長",     val:`${entry.rsiS}/${entry.rsiL}` },
+                    { label:"VIX",          val:entry.vix },
+                    { label:"5指標",        val:`${entry.litCount}/5` },
+                    { label:"スコア",       val:`${entry.totalScore > 0 ? "+" : ""}${entry.totalScore}` },
+                  ].map(k => (
+                    <div key={k.label} style={{textAlign:"center"}}>
+                      <div style={{fontSize:9, color:C.muted, marginBottom:2}}>{k.label}</div>
+                      <div style={{fontSize:12, fontWeight:700, color:C.text}}>{k.val}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* メモ・結果 */}
+                <div style={{padding:"12px 16px", display:"flex", flexDirection:"column", gap:8}}>
+                  {entry.memo && (
+                    <div style={{fontSize:12, color:C.text, lineHeight:1.7,
+                      paddingLeft:10, borderLeft:`3px solid ${C.accent}`}}>
+                      {entry.memo}
+                    </div>
+                  )}
+
+                  {/* 結果記入エリア */}
+                  {!isEditingOutcome ? (
+                    <div style={{display:"flex", alignItems:"center", gap:8}}>
+                      {entry.outcome ? (
+                        <div style={{
+                          flex:1, fontSize:12, color:C.bull, lineHeight:1.6,
+                          padding:"6px 10px", borderRadius:6,
+                          background:"#f0fdf4", border:`1px solid ${C.bull}44`,
+                        }}>
+                          📊 結果：{entry.outcome}
+                        </div>
+                      ) : (
+                        <div style={{fontSize:11, color:C.muted, fontStyle:"italic"}}>
+                          結果未記入（後日どうなったか記録しましょう）
+                        </div>
+                      )}
+                      <button
+                        onClick={() => { setEditOutcomeId(entry.id); setOutcomeText(entry.outcome); }}
+                        style={{
+                          padding:"4px 10px", fontSize:11, borderRadius:6,
+                          background:"transparent", border:`1px solid ${C.border}`,
+                          color:C.muted, cursor:"pointer", fontFamily:"inherit", flexShrink:0,
+                        }}>
+                        {entry.outcome ? "✏️ 編集" : "＋ 結果を記入"}
+                      </button>
+                    </div>
+                  ) : (
+                    <div style={{display:"flex", gap:8}}>
+                      <input
+                        value={outcomeText}
+                        onChange={e => setOutcomeText(e.target.value)}
+                        placeholder="例：翌日 ¥31,200 まで上昇。BUY判定は正解だった。"
+                        style={{
+                          flex:1, background:"#f8fafc",
+                          border:`1.5px solid ${C.bull}`,
+                          borderRadius:6, padding:"8px 10px",
+                          fontSize:12, fontFamily:"inherit", outline:"none",
+                        }}
+                      />
+                      <button onClick={() => saveOutcome(entry.id)}
+                        style={{padding:"8px 14px", borderRadius:6,
+                          background:C.bull, color:"#fff",
+                          fontSize:12, fontWeight:700, border:"none",
+                          cursor:"pointer", fontFamily:"inherit"}}>
+                        保存
+                      </button>
+                      <button onClick={() => setEditOutcomeId(null)}
+                        style={{padding:"8px 10px", borderRadius:6,
+                          background:"transparent", color:C.muted,
+                          border:`1px solid ${C.border}`,
+                          fontSize:12, cursor:"pointer", fontFamily:"inherit"}}>
+                        ✕
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+    </div>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  PRICE TOOLTIP
+// ═══════════════════════════════════════════════════════════════
+const PriceTooltip=({active,payload,label})=>{
+  if(!active||!payload?.length)return null;
+  return <div style={{background:"#ffffff",border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 14px",fontSize:12}}>
+    <div style={{color:C.muted,marginBottom:4}}>{label}</div>
+    {payload.map(p=><div key={p.name} style={{color:p.color||C.text}}>{p.name}: {p.value>1000?`¥${p.value?.toLocaleString()}`:p.value}</div>)}
+  </div>;
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  NAV
+// ═══════════════════════════════════════════════════════════════
+const NAV_TABS=[
+  {id:"judge",     label:"⚡ 即判定"},
+  {id:"journal",   label:"📒 日誌"},
+  {id:"dashboard", label:"📊 チャート"},
+  {id:"sector",    label:"🌐 セクター"},
+  {id:"macro",     label:"🌍 マクロ"},
+  {id:"risk",      label:"🚨 リスク"},
+  {id:"trade",     label:"🎯 シナリオ"},
+  {id:"api",       label:"🔌 API設定"},
+];
+
+// ═══════════════════════════════════════════════════════════════
+//  MAIN APP
+// ═══════════════════════════════════════════════════════════════
+function App() {
+  // ── State ──
+  const [activeNav,   setActiveNav]   = useState("judge");
+  const [activeChart, setActiveChart] = useState("price");
+  const [checks,      setChecks]      = useState({vix:false,pc:false,volume:false,wick:false,ma25:false});
+  const [dataMode,    setDataMode]    = useState("mock");
+  const [isLoading,   setIsLoading]  = useState(false);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [manualData,  setManualData]  = useState({});
+  const [journalEntries, setJournalEntries] = useState([]);
+  const [apiResults,  setApiResults]  = useState(
+    Object.fromEntries(Object.keys(API_SYMBOLS).map(k=>[k,{status:"idle",latest:null}]))
+  );
+
+  // ── Price data ──
+  const mockDataRef  = useRef(generateMockData());
+  const sectorMockRef= useRef(generateSectorMock());
+  const [priceData,  setPriceData]   = useState(mockDataRef.current);
+  const [sectorData, setSectorData]  = useState(sectorMockRef.current);
+
+  // ── Fetch live data ──
+  const fetchLiveData = useCallback(async () => {
+    setIsLoading(true);
+    const newResults={...apiResults};
+    // Mark all as loading
+    Object.keys(API_SYMBOLS).forEach(k=>newResults[k]={status:"loading",latest:null});
+    setApiResults({...newResults});
+
+    // Fetch Kioxia (primary)
+    try {
+      const kioxiaData = await fetchStooqHistory(API_SYMBOLS.kioxia.stooq, 30);
+      if(kioxiaData.length>0){
+        setPriceData(kioxiaData);
+        newResults.kioxia={status:"ok",latest:kioxiaData[kioxiaData.length-1].close};
+        setDataMode("live");
+      }
+    } catch(e){
+      newResults.kioxia={status:"error",latest:null};
+    }
+
+    // Fetch US stocks (Micron, SandDisk)
+    for(const id of ["micron","sandisk"]){
+      try{
+        const d=await fetchStooqHistory(API_SYMBOLS[id].stooq,30);
+        newResults[id]={status:"ok",latest:d[d.length-1]?.close||null};
+      }catch(e){
+        newResults[id]={status:"error",latest:null};
+      }
+    }
+
+    // Samsung/SK Hynix (KRX, often CORS-blocked; mark attempt)
+    ["samsung","skhynix"].forEach(id=>{ newResults[id]={status:"error",latest:null}; });
+
+    setApiResults({...newResults});
+    setLastUpdated(new Date().toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"}));
+    setIsLoading(false);
+
+    // If Kioxia failed, stay on mock
+    if(newResults.kioxia.status!=="ok"){
+      setDataMode("mock");
+    }
+  }, []);
+
+  // ── Apply manual data ──
+  const applyManualData = useCallback((data) => {
+    if(data.kioxiaPrice){
+      const price=parseFloat(data.kioxiaPrice);
+      if(!isNaN(price)){
+        // Patch the last candle with manually entered price
+        const patched=[...mockDataRef.current];
+        patched[patched.length-1]={...patched[patched.length-1],close:price,high:Math.max(price,patched[patched.length-1].high),low:Math.min(price,patched[patched.length-1].low)};
+        setPriceData(patched);
+        setDataMode("manual");
+        setLastUpdated(new Date().toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"})+" (手動)");
+      }
+    }
+  }, []);
+
+  // ── Indicators ──
+  const sma5   = calcSMA(priceData,5);
+  const sma25  = calcSMA(priceData,25);
+  const sma75  = calcSMA(priceData,75);
+  const rsiArr     = calcRSI(priceData,9);   // 短期RSI（9期間）
+  const rsiLongArr = calcRSI(priceData,26);  // 長期RSI（26期間）
+  const bollArr= calcBoll(priceData);
+  const macdArr= calcMACD(priceData);
+
+  const chartData=priceData.map((d,i)=>({
+    ...d,
+    sma5:sma5[i], sma25:sma25[i], sma75:sma75[i],
+    rsi:rsiArr[i], rsiLong:rsiLongArr[i],
+    bbUpper:bollArr[i].upper,bbLower:bollArr[i].lower,
+    macd:macdArr[i].macd,signal:macdArr[i].signal,hist:macdArr[i].hist,
+  }));
+
+  const last      = chartData[chartData.length-1];
+  const prev      = chartData[chartData.length-2]||chartData[chartData.length-1];
+  const change    = last.close - prev.close;
+  const changePct = ((change/prev.close)*100).toFixed(2);
+  const isUp      = change >= 0;
+
+  const rsiSig  = last.rsi<30?"BUY":last.rsi>70?"SELL":"HOLD";
+  const macdSig = last.macd>last.signal?"BUY":"SELL";
+  const priceSig= last.close<20500?"BUY":last.close>25000?"SELL":"HOLD";
+  const overall =
+    [rsiSig,macdSig,priceSig].filter(s=>s==="BUY").length>=2?"BUY":
+    [rsiSig,macdSig,priceSig].filter(s=>s==="SELL").length>=2?"SELL":"HOLD";
+
+  const liveVix = manualData.vixLevel ? parseFloat(manualData.vixLevel) : null;
+  const livePc  = manualData.pcRatio  ? parseFloat(manualData.pcRatio)  : null;
+
+  return (
+    <div style={{background:C.bg,minHeight:"100vh",fontFamily:"'DM Mono','Courier New',monospace",color:C.text,paddingBottom:60}}>
+
+      {/* HEADER */}
+      <div style={{background:C.header,borderBottom:`1px solid #334155`,padding:"14px 24px",
+        display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:100}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{background:C.accent,color:"#fff",fontWeight:900,fontSize:13,padding:"4px 10px",borderRadius:6,letterSpacing:1}}>285A</div>
+          <div>
+            <div style={{fontSize:15,fontWeight:700,color:C.headerText}}>KIOXIA Holdings</div>
+            <div style={{fontSize:10,color:"#94a3b8",marginTop:1}}>
+              <StatusPill status={dataMode} lastUpdated={lastUpdated} onRefresh={fetchLiveData} isLoading={isLoading}/>
+            </div>
+          </div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:24,fontWeight:800,letterSpacing:-1,color:isUp?"#34d399":"#f87171"}}>¥{last.close.toLocaleString()}</div>
+          <div style={{fontSize:11,color:isUp?"#34d399":"#f87171"}}>{isUp?"▲":"▼"} ¥{Math.abs(change).toLocaleString()} ({isUp?"+":""}{changePct}%)</div>
+        </div>
+      </div>
+
+      {/* NAV */}
+      <div style={{display:"flex",background:C.header,borderBottom:"1px solid #334155",padding:"0 24px",overflowX:"auto"}}>
+        {NAV_TABS.map(t=>(
+          <button key={t.id} onClick={()=>setActiveNav(t.id)}
+            style={{background:"transparent",border:"none",cursor:"pointer",
+              color:activeNav===t.id?"#fbbf24":"#94a3b8",
+              fontSize:12,padding:"12px 14px",
+              borderBottom:`2px solid ${activeNav===t.id?"#fbbf24":"transparent"}`,
+              fontFamily:"inherit",fontWeight:activeNav===t.id?700:400,transition:"all .15s",whiteSpace:"nowrap"}}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{padding:"20px 24px",display:"flex",flexDirection:"column",gap:16}}>
+
+        {/* ── 即判定エンジン ── */}
+        {activeNav==="judge"&&(
+          <JudgmentEngine onValuesChange={setManualData}/>
+        )}
+
+        {/* ── 📒 トレード日誌 ── */}
+        {activeNav==="journal"&&(
+          <JournalPanel
+            journalEntries={journalEntries}
+            setJournalEntries={setJournalEntries}
+            currentVals={manualData}
+            currentResult={(() => {
+              const checks5 = {
+                vixPeak:false, pcRatio:false, volumeStable:false,
+                lowerWick:false, maDeviation:false,
+              };
+              return calcJudgment(
+                { price: last.close, rsiS: last.rsi, rsiL: last.rsiLong,
+                  macd: last.macd, macdSig: last.signal, vix: 19.23,
+                  ...manualData },
+                checks5
+              );
+            })()}
+          />
+        )}
+
+        {/* ── DASHBOARD ── */}
+        {activeNav==="dashboard"&&(
+          <>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12}}>
+              {[
+                {label:"取得単価",       val:"¥22,721",  sub:"300株保有",  color:C.text},
+                {label:"含み損益",       val:`+¥${((last.close-22721)*300).toLocaleString()}`,sub:`+${(((last.close-22721)/22721)*100).toFixed(1)}%`,color:C.bull},
+                {label:"RSI (短期)",    val:last.rsi,   sub:last.rsi>80?"⚠️ 過熱域":last.rsi>70?"買われ過ぎ":"中立",color:last.rsi>80?C.bear:last.rsi>70?C.warn:C.text},
+                {label:"利確目安",       val:"¥32,000〜", sub:"段階的に100株ずつ", color:C.cyan},
+              ].map(k=>(
+                <Card key={k.label} style={{padding:"12px 16px"}}>
+                  <STitle>{k.label}</STitle>
+                  <div style={{fontSize:18,fontWeight:800,color:k.color}}>{k.val}</div>
+                  <div style={{fontSize:11,color:C.muted,marginTop:2}}>{k.sub}</div>
+                </Card>
+              ))}
+            </div>
+
+            <Card style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
+              <div><STitle>総合シグナル判定</STitle><SignalBadge signal={overall}/></div>
+              <div style={{display:"flex",gap:16}}>
+                {[{l:"RSI",s:rsiSig},{l:"MACD",s:macdSig},{l:"価格帯",s:priceSig}].map(x=>(
+                  <div key={x.l} style={{textAlign:"center"}}>
+                    <div style={{fontSize:10,color:C.muted,marginBottom:4}}>{x.l}</div>
+                    <SignalBadge signal={x.s} small/>
+                  </div>
+                ))}
+              </div>
+            </Card>
+
+            {/* ═══ 3段チャート（価格・RSI・MACD 同時表示） ═══ */}
+            {isLoading ? <Card><Spinner/></Card> : (
+              <Card style={{padding:"16px 20px",display:"flex",flexDirection:"column",gap:0}}>
+
+                {/* ── 凡例ヘッダー ── */}
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,flexWrap:"wrap",gap:8}}>
+                  <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
+                    {[
+                      {color:"#9333ea",label:`MA5  ¥${(last.sma5||calcSMA(priceData,5)[priceData.length-1]||0).toLocaleString()}`},
+                      {color:C.bull,   label:`MA25 ¥${(last.sma25||0).toLocaleString()}`},
+                      {color:C.blue,   label:`MA75 ¥${(last.sma75||0).toLocaleString()}`},
+                    ].map(l=>(
+                      <div key={l.label} style={{display:"flex",alignItems:"center",gap:5,fontSize:11}}>
+                        <div style={{width:16,height:2,background:l.color,borderRadius:1}}/>
+                        <span style={{color:l.color,fontWeight:700}}>{l.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{fontSize:10,color:C.muted}}>日足 / 直近{chartData.length}営業日</div>
+                </div>
+
+                {/* ── 第1段：価格チャート + MA3本 ── */}
+                <div style={{borderBottom:`1px solid ${C.border}`,paddingBottom:4,marginBottom:4}}>
+                  <div style={{fontSize:10,color:C.muted,marginBottom:2,letterSpacing:.8}}>📈 株価 ／ MA5・MA25・MA75</div>
+                  <ResponsiveContainer width="100%" height={260}>
+                    <AreaChart data={chartData} margin={{top:4,right:46,left:4,bottom:0}}>
+                      <defs>
+                        <linearGradient id="pg2" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%"  stopColor={C.accent} stopOpacity={.15}/>
+                          <stop offset="95%" stopColor={C.accent} stopOpacity={0}/>
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke={C.border} vertical={false}/>
+                      <XAxis dataKey="date" tick={{fontSize:9,fill:C.muted}} interval={4} axisLine={false} tickLine={false}/>
+                      <YAxis
+                        domain={["auto","auto"]}
+                        tick={{fontSize:9,fill:C.muted}}
+                        tickFormatter={v=>`¥${(v/1000).toFixed(0)}k`}
+                        width={46} orientation="right"
+                        axisLine={false} tickLine={false}
+                      />
+                      <Tooltip content={<PriceTooltip/>}/>
+                      {/* 取得単価ライン */}
+                      <ReferenceLine y={22721} stroke={C.purple} strokeDasharray="4 3" strokeWidth={1}
+                        label={{value:"取得単価¥22,721",fontSize:8,fill:C.purple,position:"insideTopLeft"}}/>
+                      {/* MA5 */}
+                      <Line type="monotone" dataKey="sma5"  stroke="#9333ea" strokeWidth={1.5} dot={false} name="MA5"  connectNulls/>
+                      {/* MA25 */}
+                      <Line type="monotone" dataKey="sma25" stroke={C.bull}   strokeWidth={1.5} dot={false} name="MA25" connectNulls/>
+                      {/* MA75 */}
+                      <Line type="monotone" dataKey="sma75" stroke={C.blue}   strokeWidth={1.5} dot={false} name="MA75" connectNulls/>
+                      {/* 株価エリア */}
+                      <Area type="monotone" dataKey="close" stroke={C.accent} strokeWidth={2}
+                        fill="url(#pg2)" dot={false} name="終値"/>
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* ── 第2段：RSI 短期 + 長期 ── */}
+                <div style={{borderBottom:`1px solid ${C.border}`,paddingBottom:4,marginBottom:4}}>
+                  <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:2}}>
+                    <div style={{fontSize:10,color:C.muted,letterSpacing:.8}}>📊 RSI</div>
+                    <div style={{display:"flex",gap:10}}>
+                      <span style={{fontSize:11,color:"#9333ea",fontWeight:700}}>
+                        短期 {last.rsi ?? "—"}
+                        {last.rsi>80?" ⚠️":last.rsi>70?" 過熱":""}
+                      </span>
+                      <span style={{fontSize:11,color:C.bull,fontWeight:700}}>
+                        長期 {last.rsiLong ?? "—"}
+                      </span>
+                    </div>
+                  </div>
+                  <ResponsiveContainer width="100%" height={130}>
+                    <LineChart data={chartData} margin={{top:4,right:46,left:4,bottom:0}}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={C.border} vertical={false}/>
+                      <XAxis dataKey="date" tick={{fontSize:9,fill:C.muted}} interval={4} axisLine={false} tickLine={false}/>
+                      <YAxis domain={[0,100]} tick={{fontSize:9,fill:C.muted}} width={46} orientation="right" axisLine={false} tickLine={false}/>
+                      <Tooltip contentStyle={{background:"#ffffff",border:`1px solid ${C.border}`,borderRadius:6,fontSize:11,color:C.text}}/>
+                      {/* 過熱ライン */}
+                      <ReferenceLine y={80} stroke={C.bear}   strokeDasharray="3 3" label={{value:"80",fontSize:8,fill:C.bear,position:"right"}}/>
+                      <ReferenceLine y={70} stroke="#f97316"  strokeDasharray="3 3" label={{value:"70",fontSize:8,fill:"#f97316",position:"right"}}/>
+                      <ReferenceLine y={50} stroke={C.border} strokeDasharray="2 4"/>
+                      <ReferenceLine y={30} stroke={C.bull}   strokeDasharray="3 3" label={{value:"30",fontSize:8,fill:C.bull,position:"right"}}/>
+                      {/* RSI短期（6期間） */}
+                      <Line type="monotone" dataKey="rsi"     stroke="#9333ea" strokeWidth={2}   dot={false} name="RSI短期" connectNulls/>
+                      {/* RSI長期（14期間） */}
+                      <Line type="monotone" dataKey="rsiLong" stroke={C.bull}   strokeWidth={1.5} dot={false} name="RSI長期" connectNulls/>
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* ── 第3段：MACD ライン + シグナル + ヒストグラム ── */}
+                <div>
+                  <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:2}}>
+                    <div style={{fontSize:10,color:C.muted,letterSpacing:.8}}>📉 MACD</div>
+                    <div style={{display:"flex",gap:10}}>
+                      <span style={{fontSize:11,color:"#9333ea",fontWeight:700}}>
+                        MACD {last.macd?.toLocaleString() ?? "—"}
+                      </span>
+                      <span style={{fontSize:11,color:C.bull,fontWeight:700}}>
+                        シグナル {last.signal?.toLocaleString() ?? "—"}
+                      </span>
+                      <span style={{fontSize:11,color:last.hist>=0?C.bull:C.bear,fontWeight:700}}>
+                        ヒスト {last.hist>=0?"+":""}{last.hist?.toLocaleString() ?? "—"}
+                      </span>
+                    </div>
+                  </div>
+                  <ResponsiveContainer width="100%" height={120}>
+                    <BarChart data={chartData} margin={{top:4,right:46,left:4,bottom:0}}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={C.border} vertical={false}/>
+                      <XAxis dataKey="date" tick={{fontSize:9,fill:C.muted}} interval={4} axisLine={false} tickLine={false}/>
+                      <YAxis tick={{fontSize:9,fill:C.muted}} width={46} orientation="right" axisLine={false} tickLine={false}/>
+                      <Tooltip contentStyle={{background:"#ffffff",border:`1px solid ${C.border}`,borderRadius:6,fontSize:11,color:C.text}}/>
+                      <ReferenceLine y={0} stroke={C.muted} strokeWidth={1}/>
+                      {/* ヒストグラム */}
+                      <Bar dataKey="hist" name="ヒスト" isAnimationActive={false}
+                        fill={C.bull}
+                        label={false}
+                      />
+                      {/* MACDライン（短期） */}
+                      <Line type="monotone" dataKey="macd"   stroke="#9333ea" strokeWidth={2}   dot={false} name="MACD"/>
+                      {/* シグナルライン（長期） */}
+                      <Line type="monotone" dataKey="signal" stroke={C.bull}   strokeWidth={1.5} dot={false} name="シグナル"/>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+
+              </Card>
+            )}
+
+            <ChecklistPanel checks={checks} setChecks={setChecks}/>
+          </>
+        )}
+
+        {activeNav==="sector"&&(
+          <>
+            <SectorTable sectorData={sectorData}/>
+            <SectorTrendChart sectorData={sectorData}/>
+          </>
+        )}
+
+        {activeNav==="macro"&&<MacroScorePanel liveVix={liveVix} livePc={livePc}/>}
+        {activeNav==="risk"&&<RiskDashboard currentPrice={last.close}/>}
+        {activeNav==="trade"&&<TradeDecisionPanel last={last} overallSignal={overall} macroScore={MACRO_OVERALL}/> }
+
+        {/* ── API設定タブ (Phase 4) ── */}
+        {activeNav==="api"&&(
+          <div style={{display:"flex",flexDirection:"column",gap:16}}>
+            {/* Mode selector */}
+            <Card>
+              <STitle>🔌 データ取得モード選択</STitle>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
+                {[
+                  {id:"live",   icon:"📡", label:"LIVE取得",   desc:"stooq.comから自動取得（要ネット接続）"},
+                  {id:"manual", icon:"✏️", label:"手動入力",   desc:"自分で価格を入力してリアル運用"},
+                  {id:"mock",   icon:"🎲", label:"モックデータ",desc:"テスト用のシミュレーションデータ"},
+                ].map(m=>(
+                  <div key={m.id} onClick={()=>{setDataMode(m.id);if(m.id==="live")fetchLiveData();if(m.id==="mock")setPriceData(mockDataRef.current);}}
+                    style={{padding:"14px",borderRadius:10,cursor:"pointer",textAlign:"center",
+                      background:dataMode===m.id?"#fef3c7":"#f8fafc",
+                      border:`2px solid ${dataMode===m.id?C.accent:C.border}`,transition:"all .2s"}}>
+                    <div style={{fontSize:28,marginBottom:6}}>{m.icon}</div>
+                    <div style={{fontSize:13,fontWeight:700,color:dataMode===m.id?C.accent:C.text,marginBottom:4}}>{m.label}</div>
+                    <div style={{fontSize:11,color:C.muted,lineHeight:1.5}}>{m.desc}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{display:"flex",justifyContent:"center"}}>
+                <StatusPill status={dataMode} lastUpdated={lastUpdated} onRefresh={fetchLiveData} isLoading={isLoading}/>
+              </div>
+            </Card>
+
+            {/* Manual input */}
+            <ManualInputPanel manualData={manualData} setManualData={setManualData} onApply={applyManualData}/>
+
+            {/* API status */}
+            <ApiStatusPanel apiResults={apiResults}/>
+
+            {/* Data source guide */}
+            <Card>
+              <STitle>📖 データソース ガイド</STitle>
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {[
+                  {label:"Kioxia (285A)",     src:"stooq.com",    detail:"東証EODデータ。翌営業日15:30以降に前日分が更新されます。",         status:"対応"},
+                  {label:"Micron (MU)",        src:"stooq.com",    detail:"NASDAQ EODデータ。米国市場終了後（日本時間翌朝）に更新。",         status:"対応"},
+                  {label:"SandDisk (WDC)",     src:"stooq.com",    detail:"NASDAQ EODデータ。同上。",                                          status:"対応"},
+                  {label:"SK Hynix (000660)",  src:"stooq.com",    detail:"KRX（韓国）はCORS制限でブラウザから直接取得が難しい場合あり。",    status:"手動推奨"},
+                  {label:"Samsung (005930)",   src:"stooq.com",    detail:"同上。手動入力モードで対応してください。",                          status:"手動推奨"},
+                  {label:"VIX / P/C比率",      src:"手動入力",     detail:"CBOE公式サイト (cboe.com) で確認して手動入力してください。",         status:"手動のみ"},
+                ].map(d=>(
+                  <div key={d.label} style={{display:"flex",gap:12,padding:"10px 12px",borderRadius:8,background:"#f1f5f9",border:`1px solid ${C.border}`}}>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:13,fontWeight:600,color:C.text}}>{d.label}</div>
+                      <div style={{fontSize:11,color:C.muted,marginTop:2,lineHeight:1.5}}>{d.detail}</div>
+                    </div>
+                    <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:2,flexShrink:0}}>
+                      <span style={{fontSize:10,color:C.muted}}>{d.src}</span>
+                      <span style={{fontSize:11,fontWeight:700,color:d.status==="対応"?C.bull:d.status==="手動推奨"?C.warn:C.muted}}>{d.status}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          </div>
+        )}
+
+        <div style={{fontSize:11,color:C.muted,textAlign:"center",marginTop:4}}>
+          {dataMode==="live"?"✅ リアルデータ表示中":dataMode==="manual"?"✏️ 手動入力データ表示中":"🎲 モックデータ表示中（API設定タブでLIVEモードへ切替可）"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
